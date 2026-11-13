@@ -1,0 +1,33 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+.vite/
+
+# Local configuration and credentials
+.env
+.env.*
+*.env
+!.env.example
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+credentials.*
+
+# Local data, logs, and databases
+AIAccess/
+data/
+logs/
+*.log
+*.sqlite
+*.db
+*.local
+
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.idea/

@@ -1,0 +1,84 @@
+/* ==========================================================================
+   Agentic OS — Model Health tab
+   ========================================================================== */
+.health-page {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 15% 0%, rgba(0, 243, 255, .06), transparent 42%),
+    radial-gradient(circle at 100% 95%, rgba(255, 0, 255, .055), transparent 43%),
+    rgba(8, 8, 14, .76);
+}
+.health-empty { display:flex; align-items:center; justify-content:center; height:100%; padding:24px; color:var(--text-muted); font-size:.8rem; text-align:center; }
+.health-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:15px 22px; border-bottom:1px solid var(--panel-border); background:rgba(6,6,12,.62); flex-shrink:0; }
+.health-brand { display:flex; align-items:center; gap:11px; }
+.health-brand-icon { width:39px; height:39px; display:grid; place-items:center; border-radius:12px; color:var(--cyan); border:1px solid var(--cyan-dim); background:linear-gradient(135deg,rgba(0,243,255,.16),rgba(255,0,255,.1)); box-shadow:0 0 18px rgba(0,243,255,.1); }
+.health-brand h1 { color:var(--cyan); font-size:.98rem; text-transform:uppercase; letter-spacing:.12em; margin:0; }
+.health-brand p { color:var(--text-muted); font-size:.7rem; margin:3px 0 0; }
+.health-actions { display:flex; gap:8px; }
+.health-btn { display:flex; align-items:center; gap:7px; padding:9px 13px; border:1px solid var(--panel-border); border-radius:9px; color:var(--text-muted); background:transparent; font:inherit; font-size:.73rem; cursor:pointer; }
+.health-btn:hover { color:var(--cyan); border-color:var(--cyan-dim); }
+.health-btn.primary { color:#061013; border-color:var(--cyan-dim); background:linear-gradient(135deg,var(--cyan),#8affff); font-weight:750; }
+.health-btn:disabled { opacity:.55; cursor:wait; }
+.health-btn svg { width:14px; height:14px; }
+.spin { animation: hspin 1s linear infinite; }
+@keyframes hspin { to { transform: rotate(360deg); } }
+
+.health-banner { display:flex; align-items:center; gap:9px; padding:10px 22px; font-size:.73rem; border-bottom:1px solid var(--panel-border); flex-shrink:0; }
+.health-banner.ok { color:var(--green); }
+.health-banner.error { color:var(--amber); }
+
+.health-providers { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; padding:14px 22px 4px; flex-shrink:0; }
+.health-provider-card { display:flex; align-items:center; gap:10px; padding:11px 13px; border:1px solid var(--panel-border); border-radius:11px; background:rgba(5,5,10,.5); }
+.health-provider-card.down { opacity:.55; }
+.hp-dot { width:9px; height:9px; flex:0 0 9px; border-radius:50%; background:var(--green); box-shadow:0 0 9px rgba(57,255,20,.55); }
+.health-provider-card.down .hp-dot { background:var(--amber); box-shadow:0 0 9px rgba(255,176,32,.55); }
+.hp-copy { flex:1; min-width:0; }
+.hp-copy b { display:block; font-size:.76rem; }
+.hp-copy small { color:var(--text-muted); font-size:.62rem; }
+.hp-stats { display:flex; flex-direction:column; align-items:flex-end; gap:3px; font-size:.64rem; color:var(--text-muted); }
+.hp-cool { color:var(--amber); }
+
+.health-body { flex:1; min-height:0; overflow:auto; padding:8px 22px 30px; display:flex; flex-direction:column; gap:18px; }
+.health-body h2 { display:flex; align-items:center; gap:8px; margin:14px 0 10px; color:var(--cyan); font-size:.82rem; text-transform:uppercase; letter-spacing:.1em; }
+.health-body h2 svg { width:15px; height:15px; }
+.health-muted { color:var(--text-muted); font-size:.72rem; }
+.health-muted.small { margin-top:10px; font-size:.64rem; }
+
+.health-activity-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:5px; }
+.health-activity-list li { display:flex; align-items:center; gap:12px; padding:9px 12px; border:1px solid var(--panel-border); border-radius:9px; background:rgba(5,5,10,.42); font-size:.72rem; }
+.ha-model { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:ui-monospace,monospace; font-size:.68rem; }
+.ha-reqs { color:var(--cyan); }
+.ha-last { color:var(--text-muted); font-size:.66rem; }
+.ha-err { display:flex; align-items:center; gap:4px; color:var(--amber); font-size:.66rem; }
+.ha-err svg { width:12px; height:12px; }
+
+.health-provider-group { margin-bottom:18px; }
+.health-provider-group h3 { display:flex; align-items:center; gap:9px; margin:0 0 7px; color:var(--text); font-size:.74rem; text-transform:uppercase; letter-spacing:.09em; }
+.hpg-key { padding:2px 8px; border-radius:999px; font-size:.6rem; letter-spacing:.04em; }
+.hpg-key.ok { color:var(--green); border:1px solid rgba(57,255,20,.28); }
+.hpg-key.bad { color:var(--amber); border:1px solid rgba(255,176,32,.35); }
+
+.health-table { width:100%; border-collapse:collapse; font-size:.71rem; }
+.health-table th { padding:6px 9px; text-align:left; color:var(--text-muted); font-size:.6rem; text-transform:uppercase; letter-spacing:.1em; border-bottom:1px solid var(--panel-border); }
+.health-table td { padding:7px 9px; border-bottom:1px solid rgba(255,255,255,.045); vertical-align:middle; }
+.health-table tr.cooling td { opacity:.55; }
+.health-table td:first-child b { display:block; font-size:.73rem; }
+.health-table td:first-child small { display:block; color:var(--text-muted); font-size:.6rem; font-family:ui-monospace,monospace; }
+
+.hflag { display:inline-block; margin-right:5px; padding:2px 7px; border-radius:999px; border:1px solid rgba(0,243,255,.25); color:var(--cyan); font-size:.6rem; }
+.hbadge { display:inline-block; padding:2px 7px; border-radius:999px; font-size:.6rem; }
+.hbadge.free { color:var(--green); border:1px solid rgba(57,255,20,.28); }
+.hbadge.paid { color:var(--magenta); border:1px solid rgba(255,0,255,.3); }
+.hbadge.cooldown { color:var(--amber); border:1px solid rgba(255,176,32,.35); }
+.hbadge.warn { color:var(--amber); border:1px solid rgba(255,176,32,.35); }
+.hstatus { font-size:.66rem; }
+.hstatus.ok { color:var(--green); }
+.hstatus.cool { color:var(--amber); }
+.hstatus.bad { color:var(--amber); }

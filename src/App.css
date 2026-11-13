@@ -1,0 +1,46 @@
+/* ==========================================================================
+   Additional styles for the enhanced Agents component
+   ========================================================================== */
+
+/* Override .agent-avatar for future agents to use icons */
+.agent-card .agent-avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--cyan);
+  background: rgba(0, 243, 255, 0.08);
+  border: 1px solid var(--cyan-dim);
+  transition: var(--transition);
+}
+
+.agent-card.active .agent-avatar {
+  background: var(--cyan-dim);
+  color: #000;
+  box-shadow: 0 0 14px var(--cyan-dim);
+}
+
+.agent-card .agent-avatar.muted {
+  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* ==========================================================================
+   Responsive adjustments for agents with new icons
+   ========================================================================== */
+
+@media (max-width: 768px) {
+  .agent-card .agent-avatar {
+    width: 32px;
+    height: 32px;
+  }
+
+  .agent-card .agent-avatar svg {
+    width: 14px;
+    height: 14px;
+  }
+}
