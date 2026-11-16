@@ -9,7 +9,7 @@ import fsp from "fs/promises";
 import dns from "node:dns/promises";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, exec } from "node:child_process";
 import { promisify } from "node:util";
 import path from "path";
 import express from "express";
@@ -134,9 +134,11 @@ const MODELS = {
 // ---------------------------------------------------------------------------
 const FALLBACK_CHAINS = {
   // Default chain for Zazu (orchestrator) - tries cloud first, then local
+  // NOTE: openrouter/baidu/ernie-5.5-flash-preview:free is deliberately NOT in
+  // these chains — it ignores the OS's [[TOOL: ...]] tag protocol and emits its
+  // native <ernie:tool_call> XML, which breaks every agent tool loop.
   default: [
     // OpenRouter free models (cloud)
-    "openrouter/baidu/ernie-5.5-flash-preview:free",
     "openrouter/google/gemma-4-26b-a4b-it:free",
     "openrouter/nvidia/nemotron-3.5-lightning:free",
     "openrouter/thinkingmachines/inkling-2-small:free",
@@ -161,7 +163,6 @@ const FALLBACK_CHAINS = {
   // Chain for coding tasks
   coder: [
     "openrouter/cohere/north-mini-code:free",
-    "openrouter/baidu/ernie-5.5-flash-preview:free",
     "openrouter/google/gemma-4-26b-a4b-it:free",
     "opencode/glm-5.3-flash-free",
     "opencode/deepseek-v4.1-flash-free",
@@ -171,7 +172,6 @@ const FALLBACK_CHAINS = {
   ],
   // Chain for research tasks (long context preferred)
   researcher: [
-    "openrouter/baidu/ernie-5.5-flash-preview:free",
     "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
     "openrouter/thinkingmachines/inkling-2-small:free",
     "opencode/nemotron-3.5-super-vl-free",
@@ -232,6 +232,11 @@ async function fetchOpencodeFree() {
   const data = await res.json();
   return (data.data || [])
     .filter((m) => isChatModelId(m.id))
+    // Keep only genuinely free models: zero token price for input AND output
+    // (the endpoint lists paid models too — without this filter they were all
+    // being cataloged as "free").
+    .filter((m) =>
+      parseFloat(m.cost?.text?.input?.price) === 0 && parseFloat(m.cost?.text?.output?.price) === 0)
     .map((m) => ({
       id: m.id,
       label: liveLabel(m.name, m.id),
@@ -498,6 +503,20 @@ app.post("/api/models/sync", async (_req, res) => {
         }
       }
 
+      // Auto-promote newly discovered free models into the default chain so
+      // agents can reach them without manual curation: appended at the tail,
+      // before the local (ollama) last-resort models. Capped per sync to keep
+      // the chain from ballooning. Chain edits are in-memory only, like the
+      // trims above — the curated chains in this file always win after restart.
+      const addedFull = added.map((id) => `${provider}/${id}`).slice(0, 10);
+      if (addedFull.length) {
+        const chain = FALLBACK_CHAINS.default;
+        let insertAt = chain.findIndex((id) => id.startsWith("ollama/"));
+        if (insertAt === -1) insertAt = chain.length;
+        const known = new Set(chain);
+        chain.splice(insertAt, 0, ...addedFull.filter((id) => !known.has(id)));
+      }
+
       results[provider] = { ok: true, total: live.length, added, removed };
     } catch (err) {
       results[provider] = { ok: false, error: err.message };
@@ -729,6 +748,8 @@ async function relayOpenAiSse(res, response) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawContent = false;
+  let upstreamError = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -741,15 +762,18 @@ async function relayOpenAiSse(res, response) {
       const trimmed = line.trim();
       if (!trimmed || !trimmed.startsWith("data:")) continue;
       const data = trimmed.slice(5).trim();
-      if (data === "[DONE]") {
-        res.write("data: [DONE]\n\n");
-        res.end();
-        return;
-      }
+      if (data === "[DONE]") break;
       try {
         const parsed = JSON.parse(data);
+        // Providers sometimes report errors inside a 200 stream — surface
+        // them instead of silently relaying nothing.
+        if (parsed.error && !sawContent) {
+          upstreamError = parsed.error?.message || JSON.stringify(parsed.error);
+          break;
+        }
         const content = parsed.choices?.[0]?.delta?.content || "";
         if (content) {
+          sawContent = true;
           res.locals.streamedContent = true;
           res.write(`data: ${JSON.stringify({ type: "delta", content })}\n\n`);
         }
@@ -757,6 +781,15 @@ async function relayOpenAiSse(res, response) {
         // ignore unparseable lines
       }
     }
+    if (upstreamError) break;
+  }
+
+  // An HTTP-200 completion with no content is a failure, not success: throw so
+  // the fallback chain moves on to the next model instead of "succeeding" with
+  // an empty response (this left routines with empty output but status "ok").
+  if (!sawContent) {
+    reader.cancel().catch(() => {});
+    throw new Error(upstreamError ? `Upstream error: ${upstreamError}` : "Upstream returned an empty completion (no content)");
   }
 
   res.write("data: [DONE]\n\n");
@@ -945,7 +978,7 @@ app.get("/api/fs/search", async (req, res) => {
   if (!root) return res.status(400).json({ error: "Path not allowed" });
 
   const results = [];
-  const TEXT_EXT = new Set([".md", ".txt", ".json", ".yaml", ".yml", ".js", ".jsx", ".ts", ".css", ".html"]);
+  const TEXT_EXT = new Set([".md", ".txt", ".json", ".yaml", ".yml", ".js", ".jsx", ".ts", ".css", ".html", ".cs"]);
 
   async function walk(dir, depth) {
     if (depth > 6 || results.length >= 200) return;
@@ -1045,6 +1078,7 @@ function canAgentWrite(agent, file) {
   if (agent === "coder") return pathInside(file, codeRoot) || pathInside(file, projectsRoot);
   if (agent === "scriber") return pathInside(file, vaultRoot) && ["notes", "reports", "logs", "learning"].includes(vaultCollection);
   if (agent === "scout") return pathInside(file, vaultRoot) && ["learning", "reports", "search"].includes(vaultCollection);
+  if (agent === "tutor") return pathInside(file, vaultRoot) && vaultCollection === "learning";
   return false;
 }
 
@@ -1062,6 +1096,112 @@ app.post("/api/fs/write", async (req, res) => {
     res.json({ ok: true, path: target, bytes: Buffer.byteLength(content, "utf8") });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Shell command execution for agents (restricted).
+// Read-preferred: destructive commands, output redirection, and pipes into
+// interpreters are blocked. cwd is confined to the allowed filesystem roots.
+// ---------------------------------------------------------------------------
+const BASH_TIMEOUT_MS = 30000;
+// Long-running unity commands (build/test/open/install, --until-ready waits)
+// legitimately take minutes; give them an extended budget.
+const BASH_LONG_TIMEOUT_MS = 600000;
+const BASH_LONG_TIMEOUT_RE = /^unity\s+(build|test|run|open|install|install-modules)\b|--until-ready|--wait\b/i;
+function bashTimeoutFor(command) {
+  return BASH_LONG_TIMEOUT_RE.test(command) ? BASH_LONG_TIMEOUT_MS : BASH_TIMEOUT_MS;
+}
+const BASH_MAX_OUTPUT = 100 * 1024; // 100 KB
+const BASH_BLOCKED_PREFIXES = [
+  "rm ", "del ", "rmdir ", "rd ", "erase ", "deltree ", "format ", "mkfs ",
+  "fdisk ", "diskpart ", "dd ", "shred ", "wipe ", "shutdown ", "reboot ",
+  "poweroff ", "halt ", "init ", "kill ", "taskkill ", "pkill ", "killall ",
+  "sudo ", "runas ", "reg ", "regedit ", "dism ", "sfc ", "bcdedit ", "bootrec ",
+  "chkdsk ", "defrag ", "mount ", "umount ", "mkfs.", "mkswap ",
+];
+const BASH_BLOCKED_PIPES = [
+  "| bash", "| sh", "| powershell", "| pwsh", "| cmd", "| python", "| python3",
+  "| node", "| perl", "| ruby", "| php", "| lua", "| octave", "| Rscript",
+];
+const BASH_BLOCKED_REDIRECTS = [">", ">>", "2>", "2>>", "1>", "1>>"];
+
+function bashCommandBlocked(cmd) {
+  const lower = cmd.toLowerCase();
+  for (const prefix of BASH_BLOCKED_PREFIXES) {
+    if (lower.startsWith(prefix) || lower.startsWith(prefix.trimEnd())) return true;
+  }
+  for (const pat of BASH_BLOCKED_PIPES) {
+    if (lower.includes(pat)) return true;
+  }
+  for (const redir of BASH_BLOCKED_REDIRECTS) {
+    if (lower.includes(` ${redir} `) || lower.endsWith(` ${redir.trimEnd()}`) || lower.includes(`\t${redir}`)) return true;
+  }
+  return false;
+}
+
+function resolveCwd(input) {
+  if (!input) return AIACCESS_ROOT;
+  const clean = String(input).replace(/["'`]/g, "").trim();
+  if (!clean) return AIACCESS_ROOT;
+  if (path.isAbsolute(clean)) {
+    const full = path.normalize(clean);
+    return isPathWithinRoots(full, [AIACCESS_ROOT, PROJECT_ROOT, REFERENCE_ROOT]) ? full : null;
+  }
+  const full = path.resolve(AIACCESS_ROOT, clean);
+  return isPathWithinRoots(full, [AIACCESS_ROOT, PROJECT_ROOT, REFERENCE_ROOT]) ? full : null;
+}
+
+const execPromise = promisify(exec);
+
+app.post("/api/bash", async (req, res) => {
+  const { command, cwd } = req.body || {};
+  if (typeof command !== "string" || !command.trim()) {
+    return res.status(400).json({ error: "command must be a non-empty string" });
+  }
+  if (bashCommandBlocked(command)) {
+    return res.status(403).json({ error: "Command blocked: destructive commands, output redirection, and pipes to interpreters are not allowed." });
+  }
+  const workDir = resolveCwd(cwd);
+  if (!workDir) {
+    return res.status(403).json({ error: "Working directory not allowed" });
+  }
+  const timeoutMs = bashTimeoutFor(command);
+  try {
+    const { stdout, stderr } = await execPromise(command, {
+      cwd: workDir,
+      timeout: timeoutMs,
+      maxBuffer: BASH_MAX_OUTPUT,
+      encoding: "utf8",
+    });
+    res.json({
+      ok: true,
+      command,
+      cwd: workDir,
+      exitCode: 0, // promisified exec resolves only on exit 0
+      stdout: stdout.slice(0, BASH_MAX_OUTPUT),
+      stderr: stderr.slice(0, BASH_MAX_OUTPUT),
+    });
+  } catch (err) {
+    // The command ran but exited non-zero (or was killed/timed out). That is a
+    // normal shell result, not a server error: return 200 with the output so
+    // the agent can read the failure and self-correct.
+    if (err.stdout !== undefined || err.stderr !== undefined) {
+      return res.json({
+        ok: false,
+        command,
+        cwd: workDir,
+        exitCode: typeof err.code === "number" ? err.code : null,
+        stdout: String(err.stdout || "").slice(0, BASH_MAX_OUTPUT),
+        stderr: String(err.stderr || err.message).slice(0, BASH_MAX_OUTPUT),
+        killed: Boolean(err.killed),
+        timedOut: err.code === "ETIMEDOUT",
+      });
+    }
+    let message = err.message;
+    if (err.code === "ETIMEDOUT") message = `Command timed out after ${timeoutMs / 1000}s`;
+    else if (err.killed) message = "Command was killed";
+    res.status(500).json({ ok: false, command, cwd: workDir, error: message, killed: err.killed, timedOut: err.code === "ETIMEDOUT" });
   }
 });
 
@@ -1134,22 +1274,49 @@ app.get("/api/web/search", async (req, res) => {
   }
 });
 
+// Follow redirects manually so every hop is re-validated against the SSRF
+// checks in validatePublicUrl (a naive `redirect: "follow"` would let a site
+// bounce us at internal addresses), with a hard hop limit.
+const WEB_FETCH_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  Accept: "text/html,text/plain,application/xhtml+xml",
+  "Accept-Language": "en,pl;q=0.9",
+};
+
+async function fetchPublicUrl(raw) {
+  let url = await validatePublicUrl(raw);
+  let response;
+  for (let hop = 0; hop <= 5; hop++) {
+    response = await fetch(url, { headers: WEB_FETCH_HEADERS, redirect: "manual", signal: AbortSignal.timeout(15000) });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error(`Redirect (${response.status}) without a Location header`);
+      response.body?.cancel();
+      url = await validatePublicUrl(new URL(location, url).href);
+      continue;
+    }
+    return { response, url };
+  }
+  throw new Error("Too many redirects");
+}
+
 app.get("/api/web/fetch", async (req, res) => {
   try {
-    const url = await validatePublicUrl(String(req.query.url || ""));
-    const response = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; AgenticOS/1.0)", Accept: "text/html,text/plain,application/xhtml+xml" },
-      redirect: "error",
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!response.ok) throw new Error(`Page returned ${response.status}`);
+    const { response, url } = await fetchPublicUrl(String(req.query.url || ""));
+    if (!response.ok) {
+      const err = new Error(`Page returned ${response.status}`);
+      err.upstreamStatus = response.status;
+      throw err;
+    }
     const type = response.headers.get("content-type") || "";
     if (!/text\/(html|plain)|application\/(xhtml\+xml|json)/i.test(type)) throw new Error(`Unsupported content type: ${type}`);
     const html = (await response.text()).slice(0, 1_000_000);
     const title = stripHtml((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || url.hostname);
     res.json({ url: url.href, title, content: stripHtml(html).slice(0, 24000) });
   } catch (err) {
-    res.status(400).json({ error: `Web fetch failed: ${err.message}` });
+    // Invalid input stays 400; upstream failures (403/404/5xx, timeouts,
+    // redirects, bot blocks) are 502 so the UI can tell them apart.
+    res.status(err.upstreamStatus ? 502 : 400).json({ error: `Web fetch failed: ${err.message}` });
   }
 });
 
@@ -1485,8 +1652,8 @@ app.get("/api/overview", (_req, res) => {
     "Events are stored persistently in AIAccess/Calendar/events.json and accessed through the Calendar UI or Zazu's CALENDAR/REMIND tools.",
     "",
     "UI TABS (the user's interface; you can switch tabs with [[NAVIGATE: tab]]):",
-    "- chat — conversation with you and the specialists.",
-    "- agents — agent roster, per-agent model/skill configuration.",
+    "- chat — conversation with selectable agent profiles; the main Chat is conversation-only and the right task panel can run scoped specialist tools.",
+    "- agents — distinctive agent profiles, model settings, fixed tool permissions, and editable installed-skill assignments.",
     "- health — model health dashboard: every model Agentic OS can reach (OpenRouter, opencode Zen, Hermes/Nous Portal, Ollama), provider key status, rate-limit cooldowns, live usage activity, and a \"Sync free models\" button that re-fetches each provider's free-model catalog. If the user asks which models exist, which are free vs paid, or why a model failed, point them here or summarize it.",
     "- routines — scheduled tasks you execute automatically in the background (with or without browser open). Each routine has a name, a self-contained prompt, a schedule (daily or monthly on a chosen day, with any set of hours), an agent (you or a specialist), and an enable toggle. You run routines with your full tool loop and can delegate to specialists; every run is briefed and logged to Vault/Logs/Routines. When the user asks for a recurring task in chat (\"every morning do X\", \"monthly on the 1st do Y\"), CREATE it directly with the [[ROUTINE: description]] tool — do not just point them at the tab. The user can also add or edit routines by hand on that tab, or use its \"Ask Zazu\" button to have a draft opened in the editor for review.",
     "- vault — the Vault document store (Notes, Reports, Logs, Learning, Images).",
@@ -1866,7 +2033,7 @@ import { ZAZU, FUTURE_AGENTS, TOOL_RE, WRITE_RE, DELEGATE_RE, DETAILS_RE } from 
 const ROUTINES_FILE = path.join(AIACCESS_ROOT, "Routines", "routines.json");
 const ROUTINE_LOGS_DIR = path.join(AIACCESS_ROOT, "Vault", "Logs", "Routines");
 const SELF_BASE = `http://127.0.0.1:${PORT}`;
-const ROUTINE_MAX_STEPS = 8;
+const ROUTINE_MAX_STEPS = 16;
 
 function loadRoutines() {
   try {
@@ -1881,6 +2048,24 @@ function saveRoutines(data) {
   fs.mkdirSync(path.dirname(ROUTINES_FILE), { recursive: true });
   fs.writeFileSync(ROUTINES_FILE, JSON.stringify(data, null, 2));
 }
+
+// On startup, close out runs left "running" by a previous server crash so they
+// don't look stuck forever.
+(function closeStaleRuns() {
+  try {
+    const data = loadRoutines();
+    let changed = false;
+    for (const run of data.runs) {
+      if (run.status === "running") {
+        run.status = "error";
+        run.output = (run.output || "") + "\n\n(Run aborted — the server restarted mid-run.)";
+        run.finishedAt = new Date().toISOString();
+        changed = true;
+      }
+    }
+    if (changed) saveRoutines(data);
+  } catch { /* ignore */ }
+})();
 
 // Next due timestamp for a schedule: { type: "daily"|"monthly", hours: [0-23], minute, dayOfMonth }
 function computeNextRun(schedule, from = Date.now()) {
@@ -1921,6 +2106,7 @@ async function routineChat(messages, { model = null, fallbackChain = "default" }
   if (!res.ok) throw new Error(`chat failed ${res.status}`);
   const text = await res.text();
   let out = "";
+  let fatal = null;
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("data:")) continue;
@@ -1929,8 +2115,11 @@ async function routineChat(messages, { model = null, fallbackChain = "default" }
     try {
       const p = JSON.parse(payload);
       if (p.type === "delta" && p.content) out += p.content;
+      if (p.type === "fatal" && !fatal) fatal = p.error || "stream failed";
     } catch { /* ignore */ }
   }
+  // Don't swallow a dead chain as an empty-but-"ok" run: surface the failure.
+  if (!out.trim() && fatal) throw new Error(`chat failed: ${fatal}`);
   return out.trim();
 }
 
@@ -1950,6 +2139,9 @@ async function runRoutineTool(tool, arg, writeBody = "", agent = "zazu") {
         return (d.content || "").slice(0, 8000) + (d.truncated ? "\n…(truncated)" : "");
       }
       case "WRITE": {
+        if (!writeBody || !writeBody.trim()) {
+          return `WRITE ERROR: no file content received (refusing to overwrite with an empty file). Re-emit the complete block — [[WRITE: ${a}]] on its own line, the full file contents on the following lines, then [[/WRITE]] on its own line.`;
+        }
         const r = await fetch(`${SELF_BASE}/api/fs/write`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path: a, content: writeBody, agent }),
@@ -1968,6 +2160,18 @@ async function runRoutineTool(tool, arg, writeBody = "", agent = "zazu") {
       case "LEARN": {
         await fetch(`${SELF_BASE}/api/learn`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: a }) });
         return `Learned: ${a}`;
+      }
+      case "BASH": {
+        const r = await fetch(`${SELF_BASE}/api/bash`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ command: a }),
+        });
+        const d = await r.json();
+        if (d.error) return `BASH ERROR: ${d.error}`;
+        const parts = [`exit: ${d.exitCode ?? "?"}`];
+        if (d.stdout) parts.push(String(d.stdout).slice(0, 6000));
+        if (d.stderr) parts.push(`stderr:\n${String(d.stderr).slice(0, 2000)}`);
+        return parts.join("\n").slice(0, 8000);
       }
       case "SEARCH": {
         const d = await (await fetch(`${SELF_BASE}/api/web/search?q=${encodeURIComponent(a)}`)).json();
@@ -2021,7 +2225,7 @@ async function routineAgentLoop(agentId, task, extraSystem = "", signal) {
       ? `\n\nYour available tool names are: ${(profile.tools || []).join(", ")}. Use only these tools. Emit only that single tag (WRITE uses [[WRITE: path]], complete contents, [[/WRITE]]). Keep the final response concise and state clearly what was completed.`
       : "\n\nThis profile is chat-only. Give advice or a draft only.";
   }
-  system += `\n\nAUTOMATED SCHEDULED RUN: no user is watching. Do not use [[ASK]]; decide and proceed. Skip [[NAVIGATE]]. Finish with your normal briefing format ("**Brief:**" first).`;
+  system += `\n\nAUTOMATED SCHEDULED RUN: no user is watching. Decide and proceed. Skip [[NAVIGATE]]. Finish with your normal briefing format ("**Brief:**" first).\nHARD RULES for this run: (1) NEVER emit [[ASK]] and never ask any question — there is no one to answer; (2) never say you are waiting for anyone — you have all the tools you need, use them yourself; (3) every tool tag MUST be closed exactly as [[TOOL: argument]] with two closing brackets — a malformed tag ends your run prematurely; (4) complete the WHOLE task before your final briefing; if one source fails, move on to the next and note it.`;
   if (extraSystem) system += "\n\n" + extraSystem;
 
   let memory = "";
@@ -2066,14 +2270,28 @@ async function routineAgentLoop(agentId, task, extraSystem = "", signal) {
     }
 
     const writeMatch = turn.match(WRITE_RE);
-    const toolMatch = turn.match(TOOL_RE);
-    if (!toolMatch) break; // final briefing
+    // Process ALL tool tags in the turn (models often batch several searches
+    // in one message); one tag per turn burned the step budget before.
+    // The [[WRITE: path]] header inside a WRITE block also matches TOOL_RE, so
+    // strip the whole write block out first — otherwise the file gets written
+    // correctly and then overwritten with empty content by the duplicate pass.
+    let toolSource = turn;
+    if (writeMatch) toolSource = turn.replace(WRITE_RE, "");
+    const toolMatches = [...toolSource.matchAll(new RegExp(TOOL_RE.source, "gi"))];
+    if (!writeMatch && toolMatches.length === 0) break; // final briefing
 
-    const result = await runRoutineTool(toolMatch[1], toolMatch[2], writeMatch?.[2] || "", agentId);
+    const results = [];
+    if (writeMatch) {
+      results.push(`WRITE ${writeMatch[1]} → ${await runRoutineTool("WRITE", writeMatch[1], writeMatch[2] || "", agentId)}`);
+    }
+    for (const m of toolMatches) {
+      const result = await runRoutineTool(m[1], m[2], "", agentId);
+      results.push(`${m[1]}: ${m[2].trim()}\n${String(result).slice(0, 4000)}`);
+    }
     history = [
       ...history,
       { role: "assistant", content: turn },
-      { role: "user", content: `TOOL RESULT (${toolMatch[1]}: ${toolMatch[2].trim()}):\n${result.slice(0, 6000)}\n\nContinue. Either run the next single tool tag, or deliver one concise final briefing.` },
+      { role: "user", content: `TOOL RESULTS:\n${results.join("\n\n---\n\n").slice(0, 12000)}\n\nContinue. Either run the next tool tag(s), or deliver one concise final briefing.` },
     ];
   }
   // Strip agent tags from the final text for storage
@@ -2083,7 +2301,7 @@ async function routineAgentLoop(agentId, task, extraSystem = "", signal) {
 // Skills assigned to an agent for background runs. The browser keeps
 // assignments in localStorage; the server falls back to sensible defaults
 // (Scout ships with web-search). Reads SKILL.md from the installed library.
-const SERVER_SKILL_DEFAULTS = { scout: ["web-search"] };
+const SERVER_SKILL_DEFAULTS = { scout: ["web-search"], coder: ["unity-cli", "unity-package-management"] };
 
 function loadAgentSkillsForRun(agentId, budget = 20000) {
   const slugs = SERVER_SKILL_DEFAULTS[agentId] || [];

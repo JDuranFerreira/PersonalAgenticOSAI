@@ -25,6 +25,7 @@ function defaults(agentId) {
       imageModel: "flux-2-klein-9b",
       voice: true,
       ttsEngine: "kokoro",
+      ttsVoice: "",
     };
   }
 
@@ -37,11 +38,11 @@ function defaults(agentId) {
     model: ZAZU_FAST_MODELS[0].id,
     fallbackModel: "",
     localModel: ZAZU_LOCAL_MODELS[0].id,
-    // Scout ships with the web-search skill for better query crafting & sourcing
-    skills: agentId === "scout" ? ["web-search"] : [],
+    skills: agent.defaultSkills || [],
     ...(agentId === "artist" ? { imageModel: "flux-2-klein-9b" } : {}),
-    voice: true,
+    voice: agentId === "zazu",
     ttsEngine: "kokoro",
+    ttsVoice: "",
   };
 }
 

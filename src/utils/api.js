@@ -75,6 +75,14 @@ export async function* streamChat({
 // Cached for the session after the first fetch.
 // ---------------------------------------------------------------------------
 let catalogCache = null;
+const catalogListeners = new Set();
+
+// Invalidation event: syncFreeModels() notifies subscribers so mounted
+// dropdowns re-fetch immediately instead of staying stale until remount.
+export function onCatalogInvalidated(fn) {
+  catalogListeners.add(fn);
+  return () => catalogListeners.delete(fn);
+}
 
 const PROVIDER_PREFIX = { openrouter: "openrouter", ollama: "ollama", opencode: "opencode", hermes: "hermes" };
 
@@ -133,6 +141,7 @@ export async function syncFreeModels() {
   const data = await res.json();
   if (!res.ok || !data.ok) throw new Error(data.error || `Sync failed ${res.status}`);
   catalogCache = null; // force the model dropdowns to re-fetch the updated catalog
+  for (const fn of catalogListeners) { try { fn(); } catch { /* listener errors must not break sync */ } }
   return data;
 }
 
@@ -251,6 +260,17 @@ export async function fsWrite(file, content, agent) {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `Write failed ${res.status}`);
+  return data;
+}
+
+export async function bashShell(command, cwd, agent) {
+  const res = await fetch(`${PROXY_URL}/api/bash`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command, cwd, agent }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `Bash failed ${res.status}`);
   return data;
 }
 

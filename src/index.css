@@ -275,6 +275,45 @@ button {
   padding-left: 2px;
 }
 
+.chat-agent-control {
+  margin-bottom: 16px;
+  padding: 11px;
+  border: 1px solid rgba(0, 243, 255, 0.16);
+  border-radius: 11px;
+  background: linear-gradient(145deg, rgba(0, 243, 255, 0.055), rgba(255, 255, 255, 0.012));
+}
+
+.chat-agent-control > label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--cyan);
+  font-size: 0.6rem;
+  font-weight: 750;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.chat-agent-select {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--cyan-dim);
+  border-radius: 8px;
+  background: #0b1018;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.78rem;
+}
+
+.chat-agent-select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.chat-agent-select:disabled { opacity: 0.6; cursor: wait; }
+.chat-agent-select option { background: #0b1018; color: var(--text); }
+.chat-agent-description { margin-top: 8px; color: var(--text-muted); font-size: 0.67rem; line-height: 1.45; }
+.chat-agent-mode { display: block; margin-top: 7px; color: #8fa4b9; font-size: 0.58rem; line-height: 1.4; }
+.chat-model-control { padding: 0 2px 12px; border-bottom: 1px solid var(--panel-border); }
+.chat-model-control .sidebar-section-title { margin-bottom: 7px; }
+.chat-mobile-agent-bar { display: none; }
+
 .sidebar-footer {
   padding: 12px;
   border-top: 1px solid var(--panel-border);
@@ -714,6 +753,7 @@ button {
   content: "";
   position: absolute;
   inset: 0;
+  pointer-events: none; /* decoration only — must not block clicks on Approve/Reject */
   background: linear-gradient(90deg, transparent, rgba(255, 184, 0, 0.06), transparent);
 }
 
@@ -1026,6 +1066,27 @@ button {
   background: rgba(255, 42, 42, 0.08);
 }
 
+.history-action {
+  width: 24px;
+  min-width: 24px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: var(--transition);
+}
+
+.history-action:hover { border-color: var(--cyan-dim); color: var(--cyan); background: rgba(0, 243, 255, 0.07); }
+.history-action.save { color: var(--green); }
+.history-rename { display: flex; align-items: center; gap: 3px; width: 100%; min-width: 0; }
+.history-rename input { flex: 1; min-width: 0; height: 28px; padding: 0 7px; border: 1px solid var(--cyan-dim); border-radius: 6px; background: rgba(15, 15, 25, 0.8); color: var(--text); font: inherit; font-size: 0.7rem; }
+.history-rename input:focus { outline: 1px solid var(--cyan); }
+
 .history-empty {
   font-size: 0.72rem;
   color: var(--text-muted);
@@ -1148,7 +1209,7 @@ button {
   cursor: pointer;
   text-align: left;
   transition: var(--transition);
-  margin-top: 8px;
+  margin-bottom: 8px;
 }
 
 .new-conv-btn:hover {
@@ -1210,6 +1271,17 @@ code {
   .agent-rail { width: 64px; }
   .agent-card-body { display: none; }
   .workspace-controls .btn span, .model-select { display: none; }
+  .chat-mobile-agent-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--panel-border);
+    background: rgba(5, 5, 8, 0.85);
+  }
+  .chat-mobile-agent-bar .chat-agent-select { flex: 1; }
+  .chat-mobile-agent-bar .model-selector { flex: 0 0 auto; }
+  .chat-mobile-agent-bar .model-selector > .btn { max-width: 138px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 }
 
 /* ==========================================================================
@@ -1805,6 +1877,117 @@ body.resizing .resize-handle {
 
 .settings-note svg { color: var(--cyan); flex-shrink: 0; }
 
+/* Agent identity, scoped tool access, and per-profile skill settings */
+.agent-capability-card {
+  --agent-accent: var(--cyan);
+  --agent-accent-soft: rgba(0, 243, 255, 0.08);
+  padding: 18px;
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 34%, transparent);
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--agent-accent-soft), rgba(14, 14, 26, 0.78) 58%);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.agent-capability-coder { --agent-accent: #73a7ff; --agent-accent-soft: rgba(74, 125, 255, 0.1); }
+.agent-capability-scriber { --agent-accent: #64dfb0; --agent-accent-soft: rgba(51, 210, 155, 0.08); }
+.agent-capability-scout { --agent-accent: #ffc16c; --agent-accent-soft: rgba(255, 172, 61, 0.085); }
+.agent-capability-artist { --agent-accent: #ff79d4; --agent-accent-soft: rgba(255, 66, 190, 0.085); }
+.agent-capability-tutor { --agent-accent: #c39aff; --agent-accent-soft: rgba(152, 103, 255, 0.11); }
+.agent-capability-researcher { --agent-accent: #9da9bc; --agent-accent-soft: rgba(154, 169, 190, 0.075); }
+
+.agent-capability-head { display: flex; align-items: flex-start; gap: 13px; }
+
+.agent-capability-avatar {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  flex: 0 0 46px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 55%, transparent);
+  border-radius: 13px;
+  background: var(--agent-accent-soft);
+  color: var(--agent-accent);
+}
+
+.agent-capability-avatar .zazu-img { object-fit: cover; object-position: center 30%; }
+.agent-capability-copy { min-width: 0; }
+.agent-section-kicker { color: var(--agent-accent); font-size: 0.59rem; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
+.agent-capability-copy h2 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin: 3px 0 5px; padding: 0; border: 0; font-size: 1rem; }
+.agent-capability-copy h2 small { color: var(--agent-accent); font-size: 0.67rem; font-weight: 600; }
+.agent-capability-copy p { color: var(--text-muted); font-size: 0.75rem; line-height: 1.5; }
+
+.agent-capability-block { margin-top: 15px; padding-top: 13px; border-top: 1px solid color-mix(in srgb, var(--agent-accent) 17%, transparent); }
+.agent-capability-label { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; color: var(--agent-accent); font-size: 0.68rem; font-weight: 750; }
+.agent-capability-label span { margin-left: auto; color: var(--text-muted); font-size: 0.6rem; font-weight: 500; }
+.agent-tool-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.agent-tool-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--agent-accent) 25%, transparent);
+  border-radius: 7px;
+  background: var(--agent-accent-soft);
+  color: var(--text);
+  font-size: 0.62rem;
+}
+
+.agent-capability-block > .settings-hint { margin-top: 8px; }
+.agent-tool-scope { margin-top: 8px; color: var(--text); font-size: 0.68rem; line-height: 1.45; }
+.agent-skill-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+
+.agent-skill-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.018);
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.agent-skill-option:hover { border-color: color-mix(in srgb, var(--agent-accent) 45%, transparent); background: var(--agent-accent-soft); }
+.agent-skill-option.checked { border-color: color-mix(in srgb, var(--agent-accent) 45%, transparent); background: var(--agent-accent-soft); }
+.agent-skill-option input { flex: 0 0 auto; margin-top: 2px; accent-color: var(--agent-accent); }
+.agent-skill-option > span { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.agent-skill-option b { color: var(--text); font-size: 0.66rem; }
+.agent-skill-option small { display: -webkit-box; overflow: hidden; color: var(--text-muted); font-size: 0.59rem; line-height: 1.4; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+
+.agent-manage-skills {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  color: var(--agent-accent);
+  font: inherit;
+  font-size: 0.65rem;
+  cursor: pointer;
+}
+
+.agent-manage-skills:hover { text-decoration: underline; }
+.agent-avatar-tutor { color: #c39aff; border-color: rgba(195, 154, 255, 0.45); background: rgba(152, 103, 255, 0.1); }
+.agent-avatar-coder { color: #73a7ff; border-color: rgba(115, 167, 255, 0.4); background: rgba(74, 125, 255, 0.1); }
+.agent-avatar-scriber { color: #64dfb0; border-color: rgba(100, 223, 176, 0.4); background: rgba(51, 210, 155, 0.08); }
+.agent-avatar-scout { color: #ffc16c; border-color: rgba(255, 193, 108, 0.4); background: rgba(255, 172, 61, 0.08); }
+.agent-avatar-artist { color: #ff79d4; border-color: rgba(255, 121, 212, 0.4); background: rgba(255, 66, 190, 0.08); }
+
+.agent-card-tutor.active { border-color: rgba(195, 154, 255, 0.5); background: rgba(152, 103, 255, 0.08); box-shadow: 0 0 16px rgba(152, 103, 255, 0.1); }
+.agent-card-coder.active { border-color: rgba(115, 167, 255, 0.5); background: rgba(74, 125, 255, 0.08); }
+.agent-card-scriber.active { border-color: rgba(100, 223, 176, 0.5); background: rgba(51, 210, 155, 0.07); }
+.agent-card-scout.active { border-color: rgba(255, 193, 108, 0.5); background: rgba(255, 172, 61, 0.07); }
+.agent-card-artist.active { border-color: rgba(255, 121, 212, 0.5); background: rgba(255, 66, 190, 0.07); }
+
+@media (max-width: 768px) {
+  .settings-body { padding: 16px; }
+  .agent-capability-card { padding: 14px; }
+  .agent-skill-grid { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 768px) {
   .agent-rail { width: 64px; }
   .agent-card-body { display: none; }
@@ -2041,11 +2224,26 @@ body.resizing .resize-handle {
 }
 
 .ledger-task {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
   color: var(--text-muted);
-  white-space: nowrap;
+}
+
+.ledger-task > span {
   overflow: hidden;
   text-overflow: ellipsis;
-  flex: 1;
+  white-space: nowrap;
+}
+
+.ledger-task small {
+  overflow: hidden;
+  color: var(--amber);
+  font-size: 0.62rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ledger-status {

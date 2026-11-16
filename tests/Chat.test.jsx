@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import Chat from "../src/components/Chat.jsx";
+import { createDelegationConversation, updateDelegationConversation } from "../src/utils/delegationConversations.js";
 
 const streamChatMock = vi.fn();
 vi.mock("../src/utils/api", async (importOriginal) => {
@@ -9,7 +10,9 @@ vi.mock("../src/utils/api", async (importOriginal) => {
   return {
     ...actual,
     fetchModels: vi.fn(async () => ({ models: {} })),
+    readSkill: vi.fn(async (slug) => ({ name: slug, content: `Test instructions for ${slug}` })),
     streamChat: (...args) => streamChatMock(...args),
+    fsList: vi.fn(async (dir) => ({ path: dir, entries: [{ type: "dir", name: "Blind Delivery" }] })),
   };
 });
 vi.mock("../src/components/ResizeHandle.jsx", () => ({ default: () => null }));
@@ -28,6 +31,57 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("chat turn handling", () => {
+  it("opens a delegated specialist in a separate conversation and shows live progress", async () => {
+    render(<Chat />);
+    const conversationId = createDelegationConversation({
+      delegationId: "delegate-chat-test",
+      agentId: "coder",
+      agentName: "Coder",
+      model: "openrouter/example",
+      task: "Inspect the input migration",
+    });
+
+    expect(await screen.findByText(/Coder is starting the task/)).toBeTruthy();
+    expect(screen.getByLabelText("Chat as").value).toBe("coder");
+    expect(screen.getByTitle("Coder: Inspect the input migration")).toBeTruthy();
+
+    updateDelegationConversation({ delegationId: "delegate-chat-test", activity: "Reading InputService.cs" });
+    expect(await screen.findByText(/Coder is working: Reading InputService.cs/)).toBeTruthy();
+    expect(conversationId).toBeTruthy();
+  });
+
+  it("switches the active chat profile and loads that agent's assigned skills", async () => {
+    const { container } = render(<Chat />);
+    const agentSelect = await screen.findByLabelText("Chat as");
+    fireEvent.change(agentSelect, { target: { value: "tutor" } });
+
+    const input = screen.getByPlaceholderText("Message the agent...");
+    fireEvent.change(input, { target: { value: "Teach me a Polish greeting" } });
+    fireEvent.click(container.querySelector(".send-btn"));
+
+    await screen.findByText("Assistant reply");
+    const request = streamChatMock.mock.calls.at(-1)[0];
+    expect(request.messages[0].content).toContain("You are Tutor");
+    expect(request.messages[0].content).toContain("Test instructions for polish-tutor");
+    expect(request.messages[0].content).toContain("CHAT TOOLS");
+    expect(JSON.parse(localStorage.getItem("agentic_os_conversations"))[0].agentId).toBe("tutor");
+  });
+
+  it("executes a scoped tool tag and feeds the result back for a final answer", async () => {
+    streamChatMock.mockImplementationOnce(() => reply("Checking the projects [[LIST: AIAccess/Projects]]"));
+    streamChatMock.mockImplementationOnce(() => reply("Found the Blind Delivery project."));
+    const { container } = render(<Chat />);
+    const input = await screen.findByPlaceholderText("Message the agent...");
+    fireEvent.change(input, { target: { value: "What projects exist?" } });
+    fireEvent.click(container.querySelector(".send-btn"));
+
+    expect(await screen.findByText("Found the Blind Delivery project.")).toBeTruthy();
+    expect(container.textContent).not.toContain("[[LIST:");
+    const followUp = streamChatMock.mock.calls.at(-1)[0];
+    expect(JSON.stringify(followUp.messages)).toContain("TOOL RESULT (LIST)");
+    expect(JSON.stringify(followUp.messages)).toContain("Blind Delivery");
+  });
+
   it("keeps the user message and renders the streamed response as an assistant message", async () => {
     const { container } = render(<Chat />);
     const input = await screen.findByPlaceholderText("Message the agent...");
@@ -35,7 +89,7 @@ describe("chat turn handling", () => {
     fireEvent.click(container.querySelector(".send-btn"));
 
     expect(await screen.findByText("Assistant reply")).toBeTruthy();
-    expect(screen.getByText("Hello")).toBeTruthy();
+    expect(container.querySelector(".message-wrapper.user")?.textContent).toContain("Hello");
     expect(container.querySelectorAll(".message-wrapper.user")).toHaveLength(1);
     expect(container.querySelectorAll(".message-wrapper.agent")).toHaveLength(1);
   });

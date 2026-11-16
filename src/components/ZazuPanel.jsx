@@ -7,19 +7,20 @@
    Settings (persona, model, wake word, voice) are edited in the Agents tab.
    ========================================================================== */
 import { useState, useEffect, useRef, useCallback } from "react";
-import { streamChat, fsList, fsRead, fsWrite, fsRawUrl, webSearch, webFetch, generateCloudImage, calendarList, calendarCreate, fetchProjects, readSkill, learnNote, fetchOverview, fetchMemory, createRoutineFromDescription, syncFreeModels } from "../utils/api";
+import { streamChat, fsList, fsRead, fsWrite, fsRawUrl, bashShell, webSearch, webFetch, generateCloudImage, calendarList, calendarCreate, fetchProjects, readSkill, learnNote, fetchOverview, fetchMemory, createRoutineFromDescription, syncFreeModels } from "../utils/api";
 import { isSttSupported, createWakeListener } from "../utils/stt";
 import { speak, stopTts, isTtsSupported, speakKokoro } from "../utils/tts";
 import Message from "./Message";
 import { ZAZU, FUTURE_AGENTS, DELEGATE_RE, TOOL_RE, WRITE_RE, DETAILS_RE } from "../agents/zazu";
 import { loadAgentSettings, saveAgentSettings, SETTINGS_EVENT } from "../agents/settings";
 import { VAULT_OPEN_EVENT, VAULT_PENDING_KEY } from "../utils/vaultEvents";
+import { createDelegationConversation, updateDelegationConversation } from "../utils/delegationConversations";
 import { catalogLabel } from "../utils/api";
 import zazuAvatar from "../assets/zazu-avatar.jpg";
 import { Mic, Ear, Volume2, VolumeX, SquareStop, ClipboardList, HelpCircle, Trash2, Send, ChevronDown } from "lucide-react";
 
 const MAX_TOOL_RESULT = 4000; // chars fed back to the model per tool result
-const MAX_ITERATIONS = 8;     // tool-loop safety cap
+const MAX_ITERATIONS = 35;     // tool-loop safety cap
 
 // Rate-limit / availability errors that justify trying the next fast model
 function isRetryableModelError(msg) {
@@ -145,14 +146,14 @@ export default function ZazuPanel() {
     if (agentId !== "zazu") {
       const enabled = profile?.status === "ready";
       prompt += enabled
-        ? `\n\nYour available tool names are: ${(profile.tools || []).join(", ")}. Use only these tools. When a tool tag is required, emit only that single tag (WRITE uses [[WRITE: path]], complete contents, [[/WRITE]]). Keep the final response concise and state clearly what was actually completed.`
+        ? `\n\nYour available tool names are: ${(profile.tools || []).join(", ")}. Use only these tools. When a tool tag is required, emit only that single tag (WRITE uses [[WRITE: path]], complete contents, [[/WRITE]]). Avoid repeating the same LIST/READ request; use its existing result and move on. Inspect only enough to act safely. If the task is too vague to act on, ask one focused question rather than exploring indefinitely. The tool loop is capped; use each step purposefully, and if you cannot complete the work, report the verified partial status without claiming success.`
         : "\n\nThis profile is chat-only in the current app. Do not claim to access files, browse the web, generate images, or execute external actions. Give advice or a draft only.";
     }
     if (osContext) prompt += "\n\n--- OS KNOWLEDGE ---\n" + osContext;
     if (agentId === "zazu" && memory) prompt += "\n\n--- MEMORY (facts you learned) ---\n" + memory;
     if (agentId === "zazu") {
       prompt += `\n\nCURRENT LOCAL DATE/TIME: ${new Date().toLocaleString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone}). Use this as the reference for relative reminder dates; ask if the user's time is ambiguous.`;
-      prompt += "\n\nCONNECTED SPECIALIST HANDOFF (current app capability): Coder, Scriber, Scout, and Artist are executable. Emit [DELEGATE: Coder â€” task], [DELEGATE: Scriber â€” task], [DELEGATE: Scout â€” task], or [DELEGATE: Artist â€” image brief] inline when appropriate. The interface runs the specialist now and gives you the result before you answer. Do not tell the user it is pending or say it will happen later. Researcher is chat-only and cannot be delegated execution yet.";
+      prompt += "\n\nCONNECTED SPECIALIST HANDOFF (current app capability): Coder, Scriber, Scout, Artist, and Tutor are executable. Emit [DELEGATE: Coder — task], [DELEGATE: Scriber — task], [DELEGATE: Scout — task], [DELEGATE: Artist — image brief], or [DELEGATE: Tutor — lesson/task] inline when appropriate. The interface runs the specialist now and gives you the result before you answer. Do not tell the user it is pending or say it will happen later. Researcher is chat-only and cannot be delegated execution yet.";
     }
     return prompt;
   }
@@ -265,6 +266,13 @@ export default function ZazuPanel() {
       const saved = await fsWrite(arg.trim(), payload, agentId);
       return `Saved ${saved.bytes} bytes to ${saved.path}`;
     }
+    if (tool === "BASH") {
+      const result = await bashShell(arg.trim(), undefined, agentId);
+      const out = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+      const tail = out.length > 3000 ? "\n…(output truncated at 3000 chars)" : "";
+      const status = result.exitCode ? ` (exit code ${result.exitCode})` : "";
+      return `Ran \`${arg.trim()}\`${status}\n\n${out}${tail}`;
+    }
     if (tool === "SEARCH") {
       const { results } = await webSearch(arg.trim());
       if (!results.length) return `No web results found for: ${arg.trim()}`;
@@ -327,6 +335,7 @@ export default function ZazuPanel() {
     if (tool === "ROUTINE") return `Creating routine: ${arg.trim()}`;
     if (tool === "SYNC") return `Syncing free models`;
     if (tool === "WRITE") return `Saved ${arg.trim()}`;
+    if (tool === "BASH") return `Shell: ${arg.trim()}`;
     if (tool === "SEARCH") return `Web search: ${arg.trim()}`;
     if (tool === "FETCH") return `Fetched ${arg.trim()}`;
     if (tool === "IMAGE") return "Generated Cloudflare image";
@@ -370,7 +379,7 @@ export default function ZazuPanel() {
     }
   }
 
-  async function runSpecialistTask(agentId, task, signal) {
+  async function runSpecialistTask(agentId, task, signal, delegationId) {
     const profile = FUTURE_AGENTS.find((agent) => agent.id === agentId);
     if (!profile || profile.status !== "ready") {
       return { ok: false, text: `${agentId} is not connected for task execution yet.` };
@@ -382,9 +391,16 @@ export default function ZazuPanel() {
     ];
     const steps = [];
     const notes = [];
+    const completedReads = new Set();
     let final = "";
+    let reachedStepLimit = true;
+    const reportProgress = (activity) => {
+      updateDelegationConversation({ delegationId, activity, status: "running" });
+      setLedger((prev) => prev.map((entry) => entry.id === delegationId ? { ...entry, activity } : entry));
+    };
 
-    for (let iteration = 0; iteration < 6; iteration++) {
+    for (let iteration = 0; iteration < 35; iteration++) {
+      reportProgress(iteration === 0 ? "Planning the task" : `Continuing after step ${steps.length}`);
       let turn = "";
       for await (const chunk of streamWithFallback({ messages: history, temperature: 0.4, notes, signal, agentSettings })) {
         turn += chunk;
@@ -393,17 +409,27 @@ export default function ZazuPanel() {
       const toolMatch = turn.match(TOOL_RE);
       if (!toolMatch) {
         final = turn.replace(WRITE_RE, "").trim();
+        reachedStepLimit = false;
         break;
       }
 
       const [, tool, arg] = toolMatch;
+      const label = describeTool(tool, arg);
+      reportProgress(label);
       let result;
-      try {
-        result = await runTool(tool, arg, writeMatch?.[2] || "", agentId);
-      } catch (err) {
-        result = `TOOL ERROR: ${err.message}`;
+      const readKey = `${tool}:${arg.trim().toLowerCase()}`;
+      if (["LIST", "READ"].includes(tool) && completedReads.has(readKey)) {
+        result = `This ${tool} request was already completed earlier. Use the existing result in context and continue with a different step or your report.`;
+      } else {
+        try {
+          result = await runTool(tool, arg, writeMatch?.[2] || "", agentId);
+        } catch (err) {
+          result = `TOOL ERROR: ${err.message}`;
+        }
+        if (["LIST", "READ"].includes(tool) && !result.startsWith("TOOL ERROR:")) completedReads.add(readKey);
       }
-      steps.push({ label: describeTool(tool, arg), output: result.slice(0, 1200) });
+      steps.push({ label, output: result.slice(0, 1200) });
+      reportProgress(`Finished ${label}`);
       history = [
         ...history,
         { role: "assistant", content: turn },
@@ -411,9 +437,27 @@ export default function ZazuPanel() {
       ];
     }
 
-    if (!final) return { ok: false, text: `Specialist reached the tool-step limit.\n${steps.map((s) => `${s.label}: ${s.output}`).join("\n")}` };
+    if (!final) {
+      const reportHistory = [
+        ...history,
+        {
+          role: "user",
+          content: "The tool-step budget is exhausted. Do not call or emit any more tools. Give the user a concise, honest status report now: what you verified, what you actually changed (if anything), and what remains. Do not claim completion unless a tool result confirms it.",
+        },
+      ];
+      let reportTurn = "";
+      try {
+        for await (const chunk of streamWithFallback({ messages: reportHistory, temperature: 0.3, signal, agentSettings })) reportTurn += chunk;
+      } catch { /* retain a deterministic partial report below */ }
+      const reportHadTool = TOOL_RE.test(reportTurn) || WRITE_RE.test(reportTurn);
+      final = reportHadTool ? "" : reportTurn.trim();
+      if (!final) {
+        final = `I couldn't finish within the tool-step budget. I completed ${steps.length} tool step${steps.length === 1 ? "" : "s"}; the task may be incomplete. No further changes are confirmed.`;
+      }
+    }
+    if (!final && !reachedStepLimit) final = "The specialist completed the available tool steps but returned no final summary.";
     const stepSummary = steps.length ? `\n\nTool actions:\n${steps.map((s) => `- ${s.label}: ${s.output}`).join("\n")}` : "";
-    return { ok: true, text: `${final}${stepSummary}`.slice(0, MAX_TOOL_RESULT) };
+    return { ok: !reachedStepLimit, text: `${final}${stepSummary}`.slice(0, MAX_TOOL_RESULT) };
   }
 
   // ---------- Task execution (typed or spoken) ----------
@@ -436,6 +480,7 @@ export default function ZazuPanel() {
     let finalTurn = "";
     const steps = [];      // { label, output } working log for the details section
     const modelNotes = []; // fallback notes from streamWithFallback
+    const delegationIds = [];
 
     try {
       history = await buildHistory([{ role: "user", content: text }]);
@@ -479,13 +524,24 @@ export default function ZazuPanel() {
             at: Date.now(),
           };
           setLedger((prev) => [...prev, item]);
+          delegationIds.push(item.id);
+          const chatConversationId = createDelegationConversation({
+            delegationId: item.id,
+            agentId: specialist?.id || "zazu",
+            agentName: item.agent,
+            model: loadAgentSettings(specialist?.id || "zazu").model,
+            task,
+          });
+          if (chatConversationId) {
+            window.dispatchEvent(new CustomEvent(NAVIGATE_EVENT, { detail: { tab: "chat" } }));
+          }
 
           let result;
           if (!specialist || specialist.status !== "ready") {
             result = { ok: false, text: `${requestedName} is listed but does not have connected execution tools yet.` };
           } else {
             try {
-              result = await runSpecialistTask(specialist.id, task, controller.signal);
+              result = await runSpecialistTask(specialist.id, task, controller.signal, item.id);
             } catch (err) {
               result = { ok: false, text: err.message || String(err) };
             }
@@ -493,6 +549,12 @@ export default function ZazuPanel() {
           if (controller.signal.aborted) throw new DOMException("Stopped by user", "AbortError");
           const completedStatus = result.ok ? "done" : "failed";
           setLedger((prev) => prev.map((entry) => entry.id === item.id ? { ...entry, status: completedStatus } : entry));
+          updateDelegationConversation({
+            delegationId: item.id,
+            status: completedStatus,
+            activity: result.ok ? "Task finished" : "Task failed",
+            result: result.text,
+          });
           steps.push({ label: `${item.agent} Â· ${completedStatus}`, output: result.text.slice(0, 1500) });
           delegationResults.push(`${item.agent} (${completedStatus}):\n${result.text}`);
           updateMessage(agentMsg.id, { content: "", streaming: true, thinking: renderSteps(steps) });
@@ -583,6 +645,9 @@ export default function ZazuPanel() {
       if (controller.signal.aborted || err.name === "AbortError") {
         setStatus("stopped");
         updateMessage(agentMsg.id, { streaming: false });
+        for (const delegationId of delegationIds) {
+          updateDelegationConversation({ delegationId, status: "stopped", result: "Stopped by user." });
+        }
       } else {
         console.error("Zazu stream error:", err);
         setStatus("idle");
@@ -628,7 +693,8 @@ export default function ZazuPanel() {
       }
     }
     if (isTtsSupported()) {
-      speak(plain.slice(0, 600), { rate: 1.15 });
+      const utterance = speak(plain.slice(0, 600), { rate: 1.15, voicePref: settingsRef.current.ttsVoice || undefined });
+      if (utterance) utterance.onend = () => setStatus("idle");
     } else {
       setStatus("idle");
     }
@@ -852,7 +918,10 @@ export default function ZazuPanel() {
             {ledger.slice(-4).map((d) => (
               <div key={d.id} className="ledger-item">
                 <span className="ledger-agent">{d.agent}</span>
-                <span className="ledger-task">{d.task}</span>
+                <span className="ledger-task">
+                  <span>{d.task}</span>
+                  {d.activity && d.status === "working" && <small>{d.activity}</small>}
+                </span>
                 <span className={`ledger-status ${d.status}`}>{d.status}</span>
               </div>
             ))}

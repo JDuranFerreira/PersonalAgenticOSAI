@@ -5,7 +5,7 @@
    Catalog is fetched once from the proxy and cached for the session.
    ========================================================================== */
 import { useEffect, useState } from "react";
-import { fetchModelCatalog, fmtContext } from "../utils/api";
+import { fetchModelCatalog, onCatalogInvalidated, fmtContext } from "../utils/api";
 
 const GROUP_LABELS = {
   openrouter: "OpenRouter — cloud, free",
@@ -29,10 +29,12 @@ export default function ModelSelect({
 
   useEffect(() => {
     let alive = true;
-    fetchModelCatalog()
+    const load = () => fetchModelCatalog()
       .then((c) => alive && setCatalog(c))
       .catch((err) => alive && setError(err.message));
-    return () => { alive = false; };
+    load();
+    const off = onCatalogInvalidated(load); // re-fetch when models are synced
+    return () => { alive = false; off(); };
   }, []);
 
   if (error) {

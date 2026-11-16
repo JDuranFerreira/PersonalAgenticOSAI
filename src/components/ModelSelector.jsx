@@ -6,11 +6,11 @@
 import { useState } from "react";
 import { MODELS, modelDisplayName } from "../utils/api";
 
-export default function ModelSelector({ value, onChange }) {
+export default function ModelSelector({ value, onChange, disabled = false, models = MODELS }) {
   const [open, setOpen] = useState(false);
 
   const byProvider = {};
-  for (const m of MODELS) {
+  for (const m of models) {
     if (!byProvider[m.provider]) byProvider[m.provider] = [];
     byProvider[m.provider].push(m);
   }
@@ -28,6 +28,7 @@ export default function ModelSelector({ value, onChange }) {
         className="btn btn-outline"
         onClick={() => setOpen(!open)}
         title="Select AI model"
+        disabled={disabled}
       >
         {value ? modelDisplayName(value) : "Model"} &nbsp;
         <span style={{ fontSize: 12 }}>{open ? "▲" : "▼"}</span>
