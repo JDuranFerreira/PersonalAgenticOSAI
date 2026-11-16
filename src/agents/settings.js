@@ -17,6 +17,7 @@ function defaults(agentId) {
       role: "Agent",
       description: "Agent settings",
       system: "You are an agent.",
+      promptVersion: 1,
       wakeWord: "agent",
       model: ZAZU_FAST_MODELS[0].id,
       fallbackModel: "",
@@ -34,6 +35,7 @@ function defaults(agentId) {
     role: agent.role,
     description: agent.description || `Agent ${agent.name}`, // fallback to id if no description
     system: agent.system || `You are ${agent.name}, an agent of Agentic OS.`,
+    promptVersion: agent.promptVersion || 1,
     wakeWord: agent.wakeWord || "agent",
     model: ZAZU_FAST_MODELS[0].id,
     fallbackModel: "",
@@ -56,9 +58,13 @@ export function loadAgentSettings(agentId) {
     const merged = { ...base, ...stored };
     // Upgrade the earlier generic specialist prompt to the profile's new
     // operational prompt, while preserving any prompt the user customized.
+    // Bumping an agent's promptVersion in zazu.js refreshes its system prompt
+    // once (overriding a stale stored copy); after that, user edits stick.
     const oldGenericPrompt = `You are ${base.name}, an agent of Agentic OS.`;
-    if (agentId !== "zazu" && (!stored.system || stored.system === oldGenericPrompt)) {
+    const versionOutdated = (stored.promptVersion ?? 1) !== base.promptVersion;
+    if (agentId !== "zazu" && (!stored.system || stored.system === oldGenericPrompt || versionOutdated)) {
       merged.system = base.system;
+      merged.promptVersion = base.promptVersion;
     }
     return merged;
   } catch {

@@ -6,7 +6,7 @@
    local model proxy server.
  ========================================================================== */
 import { useState, useEffect, useRef, useCallback } from "react";
-import { speak, speakKokoro, stopTts, isTtsSupported, getVoices } from "../utils/tts";
+import { speak, speakKokoro, stopTts, isTtsSupported, getVoices, looksPolish } from "../utils/tts";
 import { startListening, stopListening, isSttSupported } from "../utils/stt";
 import {
   streamChat, fetchModels, readSkill, fsList, fsRead, fsWrite, bashShell, webSearch, webFetch,
@@ -1009,7 +1009,9 @@ export default function Chat() {
     if (!plain) return;
     setStatus("speaking");
     const finish = () => setStatus((current) => current === "speaking" ? "idle" : current);
-    if ((agentSettings.ttsEngine || "kokoro") === "kokoro") {
+    // Kokoro's voices are English-locked — route Polish text straight to the
+    // browser voice (speak() selects an installed pl-PL voice) so it sounds right.
+    if ((agentSettings.ttsEngine || "kokoro") === "kokoro" && !looksPolish(plain)) {
       try {
         ttsUtteranceRef.current = await speakKokoro(plain.slice(0, 600), { onend: finish });
         return;

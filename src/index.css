@@ -1893,7 +1893,7 @@ body.resizing .resize-handle {
 .agent-capability-scout { --agent-accent: #ffc16c; --agent-accent-soft: rgba(255, 172, 61, 0.085); }
 .agent-capability-artist { --agent-accent: #ff79d4; --agent-accent-soft: rgba(255, 66, 190, 0.085); }
 .agent-capability-tutor { --agent-accent: #c39aff; --agent-accent-soft: rgba(152, 103, 255, 0.11); }
-.agent-capability-researcher { --agent-accent: #9da9bc; --agent-accent-soft: rgba(154, 169, 190, 0.075); }
+.agent-capability-reviewer { --agent-accent: #00d9ff; --agent-accent-soft: rgba(0, 217, 255, 0.075); }
 
 .agent-capability-head { display: flex; align-items: flex-start; gap: 13px; }
 
@@ -2265,6 +2265,10 @@ body.resizing .resize-handle {
 .ledger-status.pending { border-color: var(--amber); color: var(--amber); }
 .ledger-status.working { border-color: var(--amber); color: var(--amber); animation: blink 1.2s infinite; }
 .ledger-status.done { border-color: var(--cyan); color: var(--cyan); }
+
+.ledger-item.done { opacity: 0.6; }
+
+.ledger-item.done .ledger-task > span { text-decoration: line-through; }
 .ledger-status.failed, .ledger-status.unavailable { border-color: var(--red); color: var(--red); }
 
 .empty-icon.zazu-icon {

@@ -7,7 +7,7 @@
    ========================================================================== */
 import { useState, useEffect } from "react";
 import { ZAZU, FUTURE_AGENTS } from "../agents/zazu";
-import { loadAgentSettings, saveAgentSettings, resetAgentSettings } from "../agents/settings";
+import { loadAgentSettings, saveAgentSettings, resetAgentSettings, SETTINGS_EVENT } from "../agents/settings";
 import ModelSelect from "./ModelSelect";
 import { catalogLabel, fetchImageModels, fetchSkills, fetchRoutines, streamChat } from "../utils/api";
 import { AGENT_ACTIVITY_EVENT } from "../utils/agentActivity";
@@ -17,13 +17,13 @@ import { useResizableWidth } from "../utils/useResizableWidth";
 import { kokoroHealth, speak, speakKokoro, isTtsSupported, getVoices } from "../utils/tts";
 import { Bot, Search, Code, Image as ImageIcon, RotateCcw, Check, FileText, Globe, GraduationCap, BookOpen, Wrench, ArrowUpRight } from "lucide-react";
 
-const FUTURE_ICONS = { search: <Search size={15} />, code: <Code size={15} />, image: <ImageIcon size={15} />, fileText: <FileText size={15} />, globe: <Globe size={15} />, "graduation-cap": <GraduationCap size={17} /> };
+const FUTURE_ICONS = { search: <Search size={15} />, code: <Code size={15} />, image: <ImageIcon size={15} />, fileText: <FileText size={15} />, globe: <Globe size={15} />, "graduation-cap": <GraduationCap size={17} />, check: <Check size={15} /> };
 // Matches Chat's actual Zazu allow-list (ZAZU_CHAT_TOOLS) so the UI shows the
 // real permissions — previously RECALL and BASH were hidden here.
-const ZAZU_TOOLS = ["LIST", "READ", "ASK", "LEARN", "RECALL", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC", "BASH"];
+const ZAZU_TOOLS = ["LIST", "READ", "ASK", "LEARN", "MOVE", "RECALL", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC", "BASH"];
 const TOOL_LABELS = {
   LIST: "Browse files", READ: "Read files", ASK: "Ask you questions", WRITE: "Save files",
-  SEARCH: "Web search", FETCH: "Read web pages", IMAGE: "Create images", NAVIGATE: "Navigate tabs",
+  MOVE: "Move files/folders", SEARCH: "Web search", FETCH: "Read web pages", IMAGE: "Create images", NAVIGATE: "Navigate tabs",
   CALENDAR: "Read calendar", REMIND: "Create reminders", PROJECTS: "Inspect projects", ROUTINE: "Create routines", SYNC: "Sync models", LEARN: "Update memory",
   RECALL: "Search Vault memory", BASH: "Run shell commands",
 };

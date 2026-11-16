@@ -42,8 +42,9 @@ import "./Vault.css";
 const ROOT = "Vault";
 const IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "svg"];
 const NOTE_EXT = ["md", "txt"];
-const CODE_EXT = ["json", "yaml", "yml", "js", "jsx", "ts", "tsx", "css", "html", "py"];
-const KIND_ICON = { dir: Folder, note: FileText, code: FileCode, image: Image, binary: File };
+const HTML_EXT = ["html", "htm"];
+const CODE_EXT = ["json", "yaml", "yml", "js", "jsx", "ts", "tsx", "css", "py"];
+const KIND_ICON = { dir: Folder, note: FileText, code: FileCode, html: File, image: Image, binary: File };
 
 function extOf(name) {
   const i = name.lastIndexOf(".");
@@ -55,6 +56,7 @@ function kindOf(name, type) {
   const ext = extOf(name);
   if (IMAGE_EXT.includes(ext)) return "image";
   if (NOTE_EXT.includes(ext)) return "note";
+  if (HTML_EXT.includes(ext)) return "html";
   if (CODE_EXT.includes(ext)) return "code";
   return "binary";
 }
@@ -274,7 +276,7 @@ export default function Vault() {
     const kind = kindOf(name, "file");
     const id = ++openReqRef.current;
     const base = { path, name, kind, ...meta };
-    if (kind !== "note" && kind !== "code") {
+    if (kind !== "note" && kind !== "code" && kind !== "html") {
       setOpenFile(base);
       return;
     }
@@ -564,6 +566,18 @@ export default function Vault() {
         <div className="vault-state error">
           <p>Couldn't open this file</p>
           <code>{openFile.error}</code>
+        </div>
+      );
+    }
+    if (openFile.kind === "html") {
+      return (
+        <div className="vault-html-wrap">
+          <iframe
+            className="vault-html-frame"
+            srcDoc={openFile.content}
+            sandbox="allow-same-origin allow-scripts allow-forms"
+            title={openFile.name}
+          />
         </div>
       );
     }

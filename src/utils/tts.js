@@ -11,20 +11,97 @@ export function isTtsSupported() {
   return typeof window !== "undefined" && "speechSynthesis" in window;
 }
 
+/* --------------------------------------------------------------------------
+   Polish language routing — Kokoro's voices are English-locked, so Polish
+   text spoken through it reads like English gibberish. Detect Polish and
+   let callers fall through to a browser voice (utterance.lang = pl-PL) so
+   Windows picks a Polish voice when one is installed (e.g. Microsoft Paulina).
+   -------------------------------------------------------------------------- */
+const POLISH_LETTERS_RE = new RegExp("[\u0105\u0107\u0119\u0142\u0144\u00f3\u015b\u017a\u017c]", "i");
+// Words compared AFTER stripping non a-z characters (diacritics removed):
+// się->"si", dzień->"dzen", cześć->"czesc", dziękuję->"dziekuj", etc.
+const POLISH_COMMON_WORDS = new Set([
+  "nie", "jest", "jestem", "jestes", "jestesmy", "si", "jak", "czy", "ale",
+  "dla", "tak", "tylko", "bardzo", "dobrze", "dobry", "dzen", "czesc",
+  "dziekuj", "prosze", "ktory", "ktora", "byc", "przez", "mnie", "ciebie",
+  "tego", "tym", "wszystko", "tez", "mozna", "bedzie", "sie", "nazywam",
+]);
+
+export function looksPolish(text) {
+  const s = String(text);
+  if (POLISH_LETTERS_RE.test(s)) return true;
+  const words = s.toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).filter(Boolean);
+  let hits = 0;
+  for (const w of words) {
+    if (POLISH_COMMON_WORDS.has(w)) hits++;
+    if (hits >= 2) return true;
+  }
+  return false;
+}
+
+// Best available browser voice for Polish (or null to let the engine guess).
+function pickPolishVoice() {
+  const voices = synth.getVoices() || [];
+  return voices.find((v) => (v.lang || "").toLowerCase().startsWith("pl")) || null;
+}
+
+// A browser voice can only pronounce one language well, so split the text
+// into consecutive same-language runs (per sentence) and switch voices
+// between them: Polish sentences go to the pl-PL voice, English sentences
+// to the selected/default English voice. speechSynthesis queues utterances,
+// so they play back seamlessly.
+export function splitByLanguage(text) {
+  const parts = text.split(/(?<=[.!?…])\s+|\n+/).map((s) => s.trim()).filter(Boolean);
+  const runs = [];
+  for (const part of parts) {
+    const polish = looksPolish(part);
+    const last = runs[runs.length - 1];
+    if (last && last.polish === polish) last.text += " " + part;
+    else runs.push({ polish, text: part });
+  }
+  return runs.length ? runs : [{ polish: false, text }];
+}
+
 export function speak(text, { rate = 1, pitch = 1, voicePref = null } = {}) {
   stop();
   if (!isTtsSupported()) return null;
   synth = window.speechSynthesis;
-  utterance = new SpeechSynthesisUtterance(String(text));
-  utterance.rate = rate;
-  utterance.pitch = pitch;
-  if (voicePref) {
-    const voices = synth.getVoices();
-    const v = voices.find((x) => x.name === voicePref || x.lang === voicePref);
-    if (v) utterance.voice = v;
+
+  // Trigger voice list load on some browsers (voices may be empty at first).
+  if (!synth.getVoices().length) {
+    try { synth.onvoiceschanged = () => {}; } catch {}
   }
-  synth.speak(utterance);
-  return utterance;
+
+  const runs = splitByLanguage(String(text).trim());
+  // Returned handle: callers attach handle.onend — it fires when the final
+  // segment finishes. Keeps the old utterance.onend = fn call sites working.
+  const handle = { onend: null, segments: [] };
+  let done = false;
+  const finishOnce = () => { if (!done) { done = true; if (typeof handle.onend === "function") handle.onend(); } };
+
+  runs.forEach((run, i) => {
+    const seg = new SpeechSynthesisUtterance(run.text);
+    seg.rate = rate;
+    seg.pitch = pitch;
+    if (run.polish) {
+      // Prefer an installed Polish voice and tag the language so diacritics
+      // and consonant clusters are pronounced properly.
+      const polishVoice = voicePref ? null : pickPolishVoice();
+      if (polishVoice) seg.voice = polishVoice;
+      seg.lang = polishVoice?.lang || "pl-PL";
+    } else if (voicePref) {
+      const v = synth.getVoices().find((x) => x.name === voicePref || x.lang === voicePref);
+      if (v) seg.voice = v;
+    }
+    if (i === runs.length - 1) {
+      seg.onend = finishOnce;
+      seg.onerror = finishOnce;
+    }
+    synth.speak(seg);
+    handle.segments.push(seg);
+  });
+  utterance = handle;
+  return handle;
 }
 
 export function stopTts() {

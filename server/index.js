@@ -1174,7 +1174,7 @@ function canAgentWrite(agent, file) {
   const vaultCollection = path.relative(vaultRoot, file).split(path.sep)[0]?.toLowerCase();
   const blocked = file.toLowerCase().split(path.sep).some((part) => ["node_modules", ".git", "dist"].includes(part));
   if (blocked) return false;
-  if (agent === "coder") return pathInside(file, codeRoot) || pathInside(file, projectsRoot);
+  if (agent === "coder") return pathInside(file, codeRoot) || pathInside(file, projectsRoot) || (pathInside(file, vaultRoot) && vaultCollection === "notes");
   if (agent === "scriber") return pathInside(file, vaultRoot) && ["notes", "reports", "logs", "learning"].includes(vaultCollection);
   if (agent === "scout") return pathInside(file, vaultRoot) && ["learning", "reports", "search"].includes(vaultCollection);
   if (agent === "tutor") return pathInside(file, vaultRoot) && vaultCollection === "learning";
@@ -1193,6 +1193,49 @@ app.post("/api/fs/write", async (req, res) => {
     await fsp.mkdir(path.dirname(target), { recursive: true });
     await fsp.writeFile(target, content, "utf8");
     res.json({ ok: true, path: target, bytes: Buffer.byteLength(content, "utf8") });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Move a file or folder. Agent must have write access to both source and destination roots.
+app.post("/api/fs/move", async (req, res) => {
+  const { source: requestedSource, destination: requestedDest, agent } = req.body || {};
+  if (!requestedSource || !requestedDest) {
+    return res.status(400).json({ error: "source and destination are required" });
+  }
+  const source = resolveWriteTarget(requestedSource);
+  const destination = resolveWriteTarget(requestedDest);
+  if (!source || !destination) {
+    return res.status(400).json({ error: "source and destination must be relative paths under Vault/, Projects/, Skills/, or AgenticOS/" });
+  }
+  if (!isAllowedPath(source) || !isAllowedPath(destination)) {
+    return res.status(403).json({ error: "Path outside allowed roots" });
+  }
+  const canMove = (agentOrEmpty) => {
+    const a = String(agentOrEmpty || "").toLowerCase();
+    const blocked = source.toLowerCase().split(path.sep).some((part) => ["node_modules", ".git", "dist"].includes(part))
+      || destination.toLowerCase().split(path.sep).some((part) => ["node_modules", ".git", "dist"].includes(part));
+    if (blocked) return false;
+    const vaultRoot = path.join(AIACCESS_ROOT, "Vault");
+    const codeRoot = path.join(PROJECT_ROOT, "AgenticOS");
+    const projectsRoot = path.join(AIACCESS_ROOT, "Projects");
+    const sourceVaultCol = path.relative(vaultRoot, source).split(path.sep)[0]?.toLowerCase();
+    const destVaultCol = path.relative(vaultRoot, destination).split(path.sep)[0]?.toLowerCase();
+    const sourceInside = (root) => pathInside(source, root);
+    const destInside = (root) => pathInside(destination, root);
+    if (a === "coder") return (sourceInside(codeRoot) || sourceInside(projectsRoot) || (sourceInside(vaultRoot) && sourceVaultCol === "notes"))
+      && (destInside(codeRoot) || destInside(projectsRoot) || (destInside(vaultRoot) && destVaultCol === "notes"));
+    if (a === "zazu") return true; // Zazu may move anywhere within allowed roots
+    return false;
+  };
+  if (!canMove(agent)) {
+    return res.status(403).json({ error: `Agent ${agent || "unknown"} cannot move to that path` });
+  }
+  try {
+    await fsp.mkdir(path.dirname(destination), { recursive: true });
+    await fsp.rename(source, destination);
+    res.json({ ok: true, source, destination });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -290,6 +290,17 @@ export async function fsWrite(file, content, agent) {
   return data;
 }
 
+export async function fsMove(source, destination, agent) {
+  const res = await fetch(`${PROXY_URL}/api/fs/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source, destination, agent }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `Move failed ${res.status}`);
+  return data;
+}
+
 export async function bashShell(command, cwd, agent) {
   const res = await fetch(`${PROXY_URL}/api/bash`, {
     method: "POST",

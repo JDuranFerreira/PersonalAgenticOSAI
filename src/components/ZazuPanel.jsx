@@ -9,7 +9,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { streamChat, fsList, fsRead, fsWrite, fsRawUrl, bashShell, webSearch, webFetch, generateCloudImage, calendarList, calendarCreate, fetchProjects, readSkill, learnNote, fetchOverview, fetchMemory, createRoutineFromDescription, syncFreeModels, ragQuery } from "../utils/api";
 import { isSttSupported, createWakeListener } from "../utils/stt";
-import { speak, stopTts, isTtsSupported, speakKokoro } from "../utils/tts";
+import { speak, stopTts, isTtsSupported, speakKokoro, looksPolish } from "../utils/tts";
 import Message from "./Message";
 import { ZAZU, FUTURE_AGENTS, DELEGATE_RE, TOOL_RE, WRITE_RE, DETAILS_RE } from "../agents/zazu";
 import { loadAgentSettings, saveAgentSettings, SETTINGS_EVENT } from "../agents/settings";
@@ -41,7 +41,7 @@ export default function ZazuPanel() {
   const activeAgentRef = useRef(activeAgentId);
   useEffect(() => { activeAgentRef.current = activeAgentId; }, [activeAgentId]);
   const activeProfile = activeAgentId === "zazu"
-    ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "ASK", "LEARN", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC"] }
+    ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "ASK", "LEARN", "MOVE", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC"] }
     : FUTURE_AGENTS.find((agent) => agent.id === activeAgentId) || FUTURE_AGENTS[0];
   useEffect(() => {
     const reload = (event) => {
@@ -140,7 +140,7 @@ export default function ZazuPanel() {
 
   function systemPrompt(agentId = activeAgentRef.current, agentSettings = settingsRef.current) {
     const profile = agentId === "zazu"
-      ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "ASK", "LEARN", "RECALL", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC"] }
+      ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "ASK", "LEARN", "MOVE", "RECALL", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC"] }
       : FUTURE_AGENTS.find((agent) => agent.id === agentId);
     const base = agentSettings.system || profile?.system || "You are a helpful specialist agent.";
     let prompt = base;
@@ -154,7 +154,7 @@ export default function ZazuPanel() {
     if (agentId === "zazu" && memory) prompt += "\n\n--- MEMORY (facts you learned) ---\n" + memory;
     if (agentId === "zazu") {
       prompt += `\n\nCURRENT LOCAL DATE/TIME: ${new Date().toLocaleString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone}). Use this as the reference for relative reminder dates; ask if the user's time is ambiguous.`;
-      prompt += "\n\nCONNECTED SPECIALIST HANDOFF (current app capability): Coder, Scriber, Scout, Artist, and Tutor are executable. Emit [DELEGATE: Coder — task], [DELEGATE: Scriber — task], [DELEGATE: Scout — task], [DELEGATE: Artist — image brief], or [DELEGATE: Tutor — lesson/task] inline when appropriate. The interface runs the specialist now and gives you the result before you answer. Do not tell the user it is pending or say it will happen later. Researcher is chat-only and cannot be delegated execution yet.";
+      prompt += "\n\nCONNECTED SPECIALIST HANDOFF (current app capability): Coder, Scriber, Scout, Artist, Tutor, and Reviewer are executable. Emit [DELEGATE: Coder — task], [DELEGATE: Scriber — task], [DELEGATE: Scout — task], [DELEGATE: Artist — image brief], [DELEGATE: Tutor — lesson/task], or [DELEGATE: Reviewer — code to review] inline when appropriate. The interface runs the specialist now and gives you the result before you answer. Do not tell the user it is pending or say it will happen later.";
     }
     return prompt;
   }
@@ -229,7 +229,7 @@ export default function ZazuPanel() {
 
   async function runTool(tool, arg, payload = "", agentId = activeAgentRef.current) {
     const profile = agentId === "zazu"
-      ? { tools: ["LIST", "READ", "ASK", "LEARN", "NAVIGATE", "CALENDAR", "REMIND", "ROUTINE", "SYNC"] }
+      ? { tools: ["LIST", "READ", "ASK", "LEARN", "MOVE", "NAVIGATE", "CALENDAR", "REMIND", "ROUTINE", "SYNC"] }
       : FUTURE_AGENTS.find((agent) => agent.id === agentId);
     if (!profile?.tools?.includes(tool)) return `TOOL ERROR: ${agentId} is not allowed to use ${tool}`;
     if (tool === "LIST") {
@@ -287,6 +287,12 @@ export default function ZazuPanel() {
       if (!payload.trim()) return "TOOL ERROR: WRITE requires full file contents followed by [[/WRITE]]";
       const saved = await fsWrite(arg.trim(), payload, agentId);
       return `Saved ${saved.bytes} bytes to ${saved.path}`;
+    }
+    if (tool === "MOVE") {
+      const [src, dst] = arg.split("->").map((s) => s.trim());
+      if (!src || !dst) return "TOOL ERROR: MOVE requires 'source -> destination'";
+      const moved = await fsMove(src, dst, agentId);
+      return `Moved ${moved.source} to ${moved.destination}`;
     }
     if (tool === "BASH") {
       const result = await bashShell(arg.trim(), undefined, agentId);
@@ -358,6 +364,7 @@ export default function ZazuPanel() {
     if (tool === "ROUTINE") return `Creating routine: ${arg.trim()}`;
     if (tool === "SYNC") return `Syncing free models`;
     if (tool === "WRITE") return `Saved ${arg.trim()}`;
+    if (tool === "MOVE") return `Moved ${arg.trim()}`;
     if (tool === "BASH") return `Shell: ${arg.trim()}`;
     if (tool === "SEARCH") return `Web search: ${arg.trim()}`;
     if (tool === "FETCH") return `Fetched ${arg.trim()}`;
@@ -520,8 +527,9 @@ export default function ZazuPanel() {
       }
     }
     if (!final && !reachedStepLimit) final = "The specialist completed the available tool steps but returned no final summary.";
+    const writeCalled = steps.some((s) => s.label.startsWith("Saved"));
     const stepSummary = steps.length ? `\n\nTool actions:\n${steps.map((s) => `- ${s.label}: ${s.output}`).join("\n")}` : "";
-    return { ok: !reachedStepLimit, text: `${final}${stepSummary}`.slice(0, MAX_TOOL_RESULT) };
+    return { ok: !reachedStepLimit, text: `${final}${stepSummary}`.slice(0, MAX_TOOL_RESULT), writeCalled };
   }
 
   // ---------- Task execution (typed or spoken) ----------
@@ -654,6 +662,16 @@ export default function ZazuPanel() {
             }
           }
           if (controller.signal.aborted) throw new DOMException("Stopped by user", "AbortError");
+          // Verify Coder actually wrote a file when asked to create one
+          if (
+            result.ok &&
+            specialist?.id === "coder" &&
+            /create|write|make|build|html|page|file/i.test(task) &&
+            !result.writeCalled
+          ) {
+            result.ok = false;
+            result.text = "Task not completed: Coder did not actually write the file. No [[WRITE]] call was made. Please re-delegate with explicit instructions to write the file contents.";
+          }
           const completedStatus = result.ok ? "done" : "failed";
           setLedger((prev) => prev.map((entry) => entry.id === item.id ? { ...entry, status: completedStatus } : entry));
           updateDelegationConversation({
@@ -726,6 +744,15 @@ export default function ZazuPanel() {
         finalTurn = "I reached the tool-step limit before completing this task. Please narrow the request or ask me to continue.";
       }
 
+      // Verify WRITE was actually called for file creation tasks handled directly by Zazu
+      if (
+        activeAgentRef.current === "zazu" &&
+        /create|write|make|build|html|page|file/i.test(text) &&
+        !steps.some((s) => s.label.startsWith("Saved"))
+      ) {
+        finalTurn = "Task not completed: I did not actually write the file. No [[WRITE]] call was made. Please ask again with explicit instructions to write the file contents.";
+      }
+
       // ---- Finalise: strip delegation tags, split briefing / details ----
       let cleaned = finalTurn.replace(DELEGATE_RE, "").replace(WRITE_RE, "").trim();
       let details = "";
@@ -794,7 +821,8 @@ export default function ZazuPanel() {
     const engine = settingsRef.current.ttsEngine || "kokoro";
     setStatus("speaking");
 
-    if (engine === "kokoro") {
+    // Kokoro is English-locked; Polish text goes straight to the browser voice.
+    if (engine === "kokoro" && !looksPolish(plain)) {
       try {
         const handle = await speakKokoro(plain, {
           onend: () => setStatus("idle"),
@@ -806,7 +834,7 @@ export default function ZazuPanel() {
       }
     }
     if (isTtsSupported()) {
-      const utterance = speak(plain.slice(0, 600), { rate: 1.15, voicePref: settingsRef.current.ttsVoice || undefined });
+      const utterance = speak(plain, { rate: 1.15, voicePref: settingsRef.current.ttsVoice || undefined });
       if (utterance) utterance.onend = () => setStatus("idle");
     } else {
       setStatus("idle");
@@ -1021,15 +1049,15 @@ export default function ZazuPanel() {
         </div>
       )}
 
-      {/* Delegation ledger */}
+      {/* Todo list (delegation ledger) */}
       {ledger.length > 0 && (
-        <div className="task-ledger compact">
+        <div className="task-ledger">
           <div className="ledger-title">
-            <ClipboardList size={13} /> Delegations
+            <ClipboardList size={13} /> Todo List ({ledger.filter((d) => d.status === "done").length}/{ledger.length} done)
           </div>
           <div className="ledger-items">
-            {ledger.slice(-4).map((d) => (
-              <div key={d.id} className="ledger-item">
+            {ledger.map((d) => (
+              <div key={d.id} className={`ledger-item ${d.status === "done" ? "done" : ""}`}>
                 <span className="ledger-agent">{d.agent}</span>
                 <span className="ledger-task">
                   <span>{d.task}</span>
