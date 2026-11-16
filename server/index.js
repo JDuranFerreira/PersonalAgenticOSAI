@@ -15,6 +15,7 @@ import path from "path";
 import express from "express";
 import cors from "cors";
 import { auditGitHubSafety, isOriginAllowed, isPathWithinRoots, LOCAL_HOST } from "./security.js";
+import * as rag from "./rag.js";
 
 // Filesystem roots the agents may navigate (read-only except /api/learn)
 const AIACCESS_ROOT = "C:\\AIAssistant\\AIAccess";const PROJECTS_ROOT = path.join(AIACCESS_ROOT, "Projects");
@@ -315,21 +316,52 @@ function saveFreeModelState(state) {
 // ---------------------------------------------------------------------------
 // Per-model usage tracking ("what are the models working on")
 // ---------------------------------------------------------------------------
-const modelUsage = new Map(); // full model id -> { requests, errors, lastUsed, lastError, lastErrorAt }
+const modelUsage = new Map(); // full model id -> { requests, errors, promptTokens, completionTokens, lastUsed, lastError, lastErrorAt }
+const agentUsage = new Map(); // agent tag ("zazu", "coder", "chat"…) -> { requests, errors, promptTokens, completionTokens, lastUsed }
 
-function noteModelUse(modelId) {
-  const u = modelUsage.get(modelId) || { requests: 0, errors: 0 };
+function newUsage() {
+  return { requests: 0, errors: 0, promptTokens: 0, completionTokens: 0 };
+}
+
+function noteModelUse(modelId, tokens = null) {
+  const u = modelUsage.get(modelId) || newUsage();
   u.requests += 1;
+  if (tokens) {
+    u.promptTokens += tokens.promptTokens || 0;
+    u.completionTokens += tokens.completionTokens || 0;
+  }
   u.lastUsed = Date.now();
   modelUsage.set(modelId, u);
 }
 
 function noteModelError(modelId, message) {
-  const u = modelUsage.get(modelId) || { requests: 0, errors: 0 };
+  const u = modelUsage.get(modelId) || newUsage();
   u.errors += 1;
   u.lastError = String(message || "").slice(0, 300);
   u.lastErrorAt = Date.now();
   modelUsage.set(modelId, u);
+}
+
+// Per-agent attribution: callers may pass `agent` on /api/chat (routine runs
+// pass their agent id; the Zazu panel passes "zazu"). Untagged browser chat
+// lands under "chat".
+function noteAgentUse(agent, tokens = null) {
+  if (!agent) return;
+  const u = agentUsage.get(agent) || newUsage();
+  u.requests += 1;
+  if (tokens) {
+    u.promptTokens += tokens.promptTokens || 0;
+    u.completionTokens += tokens.completionTokens || 0;
+  }
+  u.lastUsed = Date.now();
+  agentUsage.set(agent, u);
+}
+
+function noteAgentError(agent) {
+  if (!agent) return;
+  const u = agentUsage.get(agent) || newUsage();
+  u.errors += 1;
+  agentUsage.set(agent, u);
 }
 
 // Helper: get fallback chain by name, with optional custom chain override
@@ -340,8 +372,33 @@ function getFallbackChain(chainName, customChain = null) {  if (customChain && A
 }
 
 // Helper: filter chain to only include models whose providers are available
+// Models retired mid-session (404 removed upstream, 403 region-blocked) are
+// dropped here so the chain never wastes turns dialing them again.
+const retiredModels = new Set();
+
+// A model that is gone for good (not a transient 429) should never be tried
+// again this server lifetime: splice it out of every fallback chain.
+function isPermanentModelError(message) {
+  return /no longer available|no provider serves this model|not available in your region/i.test(String(message || ""));
+}
+
+function retireModel(modelId) {
+  if (!modelId || retiredModels.has(modelId)) return;
+  retiredModels.add(modelId);
+  let removed = 0;
+  for (const chain of Object.values(FALLBACK_CHAINS)) {
+    const idx = chain.indexOf(modelId);
+    if (idx !== -1) {
+      chain.splice(idx, 1);
+      removed++;
+    }
+  }
+  if (removed) console.log(`Retired ${modelId} from ${removed} fallback chain(s) (permanent model error)`);
+}
+
 function filterAvailableModels(chain) {
   return chain.filter((modelId) => {
+    if (retiredModels.has(modelId)) return false;
     const provider = modelId.startsWith("ollama/") ? "ollama"
       : modelId.startsWith("opencode/") ? "opencode"
       : modelId.startsWith("hermes/") ? "hermes"
@@ -451,6 +508,16 @@ app.get("/api/health", (_req, res) => {
   const activity = [...modelUsage.entries()]
     .map(([modelId, u]) => ({ model: modelId, ...u }))
     .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
+  const totals = { requests: 0, errors: 0, promptTokens: 0, completionTokens: 0 };
+  for (const u of modelUsage.values()) {
+    totals.requests += u.requests || 0;
+    totals.errors += u.errors || 0;
+    totals.promptTokens += u.promptTokens || 0;
+    totals.completionTokens += u.completionTokens || 0;
+  }
+  const agents = [...agentUsage.entries()]
+    .map(([agent, u]) => ({ agent, ...u }))
+    .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0));
   const syncState = loadFreeModelState();
   res.json({
     providers: {
@@ -461,6 +528,8 @@ app.get("/api/health", (_req, res) => {
     },
     models,
     activity,
+    agents,
+    totals,
     cooldowns: [...modelLimitCache.entries()]
       .filter(([, until]) => until > now)
       .map(([modelId, until]) => ({ model: modelId, until })),
@@ -556,6 +625,7 @@ app.post("/api/chat", async (req, res) => {
     fallbackChain = "default",
     customChain = null,
     localModel,
+    agent,
   } = req.body || {};
 
   if (!isValidChatMessages(messages)) {
@@ -570,6 +640,12 @@ app.post("/api/chat", async (req, res) => {
   if (max_tokens !== undefined && (!Number.isInteger(max_tokens) || max_tokens < 1 || max_tokens > 65536)) {
     return res.status(400).json({ error: "max_tokens must be an integer between 1 and 65536" });
   }
+  if (agent !== undefined && agent !== null && (typeof agent !== "string" || agent.length > 32)) {
+    return res.status(400).json({ error: "agent must be a string under 32 characters" });
+  }
+  // Usage attribution: which agent made this call ("zazu", routine ids…);
+  // untagged browser chat is bucketed as "chat".
+  const agentTag = typeof agent === "string" && agent.trim() ? agent.trim().slice(0, 32) : "chat";
 
   // Build the fallback chain
   let chain = getFallbackChain(fallbackChain, customChain);
@@ -623,26 +699,32 @@ app.post("/api/chat", async (req, res) => {
     const cleanModelId = modelId.replace(/^(ollama|opencode|openrouter|hermes)\//, "");
 
     try {
-      // Attempt to proxy to this model
+      // Attempt to proxy to this model (returns token usage when the provider reports it)
+      let tokens = null;
       if (provider === "ollama") {
-        await proxyOllama(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
+        tokens = await proxyOllama(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
       } else if (provider === "opencode") {
-        await proxyOpencode(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
+        tokens = await proxyOpencode(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
       } else if (provider === "hermes") {
-        await proxyHermes(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
+        tokens = await proxyHermes(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
       } else {
-        await proxyOpenRouter(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
+        tokens = await proxyOpenRouter(res, cleanModelId, messages, stream, temperature, max_tokens, clientController.signal);
       }
       
       // Success - mark model healthy and track usage
       markModelHealthy(modelId);
-      noteModelUse(modelId);
+      noteModelUse(modelId, tokens || null);
+      noteAgentUse(agentTag, tokens || null);
       return;
     } catch (err) {
       if (clientController.signal.aborted || res.destroyed || res.writableEnded) return;
       lastError = err;
       console.error(`Model ${modelId} failed:`, err.message);
       noteModelError(modelId, err.message);
+      noteAgentError(agentTag);
+      // Removed upstream or region-blocked: drop it from every chain so
+      // later requests skip it instantly instead of failing again.
+      if (isPermanentModelError(err.message)) retireModel(modelId);
 
       // Do not splice a different provider's reply after content was emitted.
       if (res.locals.streamedContent) {
@@ -705,7 +787,7 @@ async function proxyHermes(res, modelId, messages, stream, temperature, maxToken
     }
 
     // OpenAI-compatible SSE format, same as OpenRouter/opencode
-    await relayOpenAiSse(res, response);
+    return await relayOpenAiSse(res, response);
   } finally {
     clearTimeout(timeout);
   }
@@ -738,7 +820,7 @@ async function proxyOpencode(res, modelId, messages, stream, temperature, maxTok
     }
 
     // Same OpenAI-compatible SSE format as OpenRouter
-    await relayOpenAiSse(res, response);
+    return await relayOpenAiSse(res, response);
   } finally {
     clearTimeout(timeout);
   }
@@ -750,6 +832,7 @@ async function relayOpenAiSse(res, response) {
   let buffer = "";
   let sawContent = false;
   let upstreamError = null;
+  let tokens = null;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -777,6 +860,14 @@ async function relayOpenAiSse(res, response) {
           res.locals.streamedContent = true;
           res.write(`data: ${JSON.stringify({ type: "delta", content })}\n\n`);
         }
+        // OpenRouter (and most OpenAI-compatible providers) append a final
+        // usage-only chunk — grab real token counts for the health stats.
+        if (parsed.usage && typeof parsed.usage === "object") {
+          tokens = {
+            promptTokens: Number(parsed.usage.prompt_tokens ?? parsed.usage.prompt_token_count) || 0,
+            completionTokens: Number(parsed.usage.completion_tokens ?? parsed.usage.candidates_token_count ?? parsed.usage.eval_count) || 0,
+          };
+        }
       } catch {
         // ignore unparseable lines
       }
@@ -794,6 +885,7 @@ async function relayOpenAiSse(res, response) {
 
   res.write("data: [DONE]\n\n");
   res.end();
+  return tokens;
 }
 
 async function proxyOpenRouter(res, modelId, messages, stream, temperature, maxTokens, clientSignal) {
@@ -824,7 +916,7 @@ async function proxyOpenRouter(res, modelId, messages, stream, temperature, maxT
       throw new Error(`OpenRouter ${response.status}: ${errText}`);
     }
 
-    await relayOpenAiSse(res, response);
+    return await relayOpenAiSse(res, response);
   } finally {
     clearTimeout(timeout);
   }
@@ -874,6 +966,7 @@ async function proxyOllama(res, modelId, messages, stream, temperature, maxToken
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let tokens = null;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -893,9 +986,14 @@ async function proxyOllama(res, modelId, messages, stream, temperature, maxToken
             res.write(`data: ${JSON.stringify({ type: "delta", content })}\n\n`);
           }
           if (parsed.done) {
+            // Ollama reports token counts on the final chunk
+            tokens = {
+              promptTokens: Number(parsed.prompt_eval_count) || 0,
+              completionTokens: Number(parsed.eval_count) || 0,
+            };
             res.write("data: [DONE]\n\n");
             res.end();
-            return;
+            return tokens;
           }
         } catch {
           // ignore unparseable lines
@@ -905,6 +1003,7 @@ async function proxyOllama(res, modelId, messages, stream, temperature, maxToken
 
     res.write("data: [DONE]\n\n");
     res.end();
+    return tokens;
   } finally {
     clearTimeout(timeout);
   }
@@ -1686,9 +1785,40 @@ app.post("/api/learn", (req, res) => {
     fs.mkdirSync(path.dirname(MEMORY_FILE), { recursive: true });
     const entry = `- [${new Date().toISOString().slice(0, 16).replace("T", " ")}] ${String(note).trim()}\n`;
     fs.appendFileSync(MEMORY_FILE, entry, "utf8");
+    void rag.reindexFile(MEMORY_FILE); // keep the RAG index current (fire-and-forget)
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// RAG — semantic retrieval over the Vault (embeddings via local Ollama,
+// vectors in LanceDB, hybrid vector+BM25 ranking fused with RRF)
+// ---------------------------------------------------------------------------
+app.get("/api/rag/status", async (_req, res) => {
+  try {
+    res.json(await rag.getStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/rag/reindex", async (req, res) => {
+  try {
+    res.json(await rag.reindex(Boolean(req.body?.force)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/rag/query", async (req, res) => {
+  try {
+    const k = Math.min(Math.max(parseInt(req.query.k, 10) || 5, 1), 12);
+    const hits = await rag.query(String(req.query.q || ""), k);
+    res.json({ query: String(req.query.q || ""), results: hits });
+  } catch (err) {
+    res.status(502).json({ error: `RAG query failed: ${err.message}` });
   }
 });
 
@@ -1715,8 +1845,17 @@ async function saveCalendarEvents(events) {
 app.get("/api/calendar/events", async (req, res) => {
   try {
     let events = await readCalendarEvents();
-    const from = Date.parse(req.query.from || "");
-    const to = Date.parse(req.query.to || "");
+    // Accept ms-timestamps (from the UI) as well as ISO date strings —
+    // Date.parse() returns NaN for 13-digit timestamp strings, which silently
+    // disabled the whole range filter.
+    const parseWhen = (v) => {
+      if (v === undefined || v === null || v === "") return NaN;
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+      return Date.parse(String(v));
+    };
+    const from = parseWhen(req.query.from);
+    const to = parseWhen(req.query.to);
     if (Number.isFinite(from)) events = events.filter((e) => Date.parse(e.endAt || e.startAt) >= from);
     if (Number.isFinite(to)) events = events.filter((e) => Date.parse(e.startAt) <= to);
     events.sort((a, b) => Date.parse(a.startAt) - Date.parse(b.startAt));
@@ -2096,11 +2235,11 @@ function describeSchedule(s) {
 }
 
 // One model turn through this server's own /api/chat (SSE), text accumulated
-async function routineChat(messages, { model = null, fallbackChain = "default" } = {}, signal) {
+async function routineChat(messages, { model = null, fallbackChain = "default", agent = null } = {}, signal) {
   const res = await fetch(`${SELF_BASE}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...(model ? { model } : {}), messages, stream: true, fallbackChain, max_tokens: 1600 }),
+    body: JSON.stringify({ ...(model ? { model } : {}), messages, stream: true, fallbackChain, max_tokens: 1600, ...(agent ? { agent } : {}) }),
     signal,
   });
   if (!res.ok) throw new Error(`chat failed ${res.status}`);
@@ -2161,6 +2300,13 @@ async function runRoutineTool(tool, arg, writeBody = "", agent = "zazu") {
         await fetch(`${SELF_BASE}/api/learn`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ note: a }) });
         return `Learned: ${a}`;
       }
+      case "RECALL": {
+        const r = await fetch(`${SELF_BASE}/api/rag/query?q=${encodeURIComponent(a)}&k=5`);
+        const d = await r.json();
+        if (d.error) return `RECALL ERROR: ${d.error}`;
+        if (!d.results || !d.results.length) return "RECALL: no matching Vault knowledge found.";
+        return d.results.map((h) => `— Vault/${h.path} · ${h.heading}\n${h.text.slice(0, 900)}`).join("\n\n");
+      }
       case "BASH": {
         const r = await fetch(`${SELF_BASE}/api/bash`, {
           method: "POST", headers: { "Content-Type": "application/json" },
@@ -2217,7 +2363,7 @@ async function runRoutineTool(tool, arg, writeBody = "", agent = "zazu") {
 // per turn, result fed back, until a turn with no tags or the step budget.
 async function routineAgentLoop(agentId, task, extraSystem = "", signal) {
   const profile = agentId === "zazu"
-    ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "WRITE", "LEARN", "SEARCH", "FETCH", "CALENDAR", "PROJECTS", "ROUTINE", "SYNC"] }
+    ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "WRITE", "LEARN", "RECALL", "SEARCH", "FETCH", "CALENDAR", "PROJECTS", "ROUTINE", "SYNC"] }
     : FUTURE_AGENTS.find((a) => a.id === agentId) || { ...ZAZU };
   let system = profile.system || "You are a helpful agent.";
   if (agentId !== "zazu") {
@@ -2232,6 +2378,15 @@ async function routineAgentLoop(agentId, task, extraSystem = "", signal) {
   try { memory = fs.readFileSync(MEMORY_FILE, "utf8"); } catch { /* none */ }
   if (agentId === "zazu" && memory) system += "\n\n--- MEMORY (facts you learned) ---\n" + memory.slice(0, 6000);
   system += loadAgentSkillsForRun(agentId);
+
+  // RAG: auto-retrieve Vault knowledge relevant to the task and inject it.
+  try {
+    const hits = await rag.query(task, 4);
+    const context = rag.formatHits(hits);
+    if (context) {
+      system += `\n\n--- RELEVANT KNOWLEDGE (auto-retrieved from the Vault by semantic search) ---\n${context}\nTreat this as reference context with sources; verify details with [[READ]] before acting on anything critical.`;
+    }
+  } catch { /* retrieval is best-effort */ }
   system += `\n\nCURRENT LOCAL DATE/TIME: ${new Date().toLocaleString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone}).`;
 
   let history = [
@@ -2239,10 +2394,42 @@ async function routineAgentLoop(agentId, task, extraSystem = "", signal) {
     { role: "user", content: task },
   ];
   let lastTurn = "";
+  // Repetition guards: free models sometimes parrot the same turn (and the same
+  // failing tool call) forever — detect it and end the run with a real briefing.
+  let lastTurnSig = "";
+  let turnRepeats = 0;
+  let lastToolSig = "";
   for (let step = 0; step < ROUTINE_MAX_STEPS; step++) {
-    const turn = await routineChat(history, {}, signal);
+    const turn = await routineChat(history, { agent: agentId }, signal);
     lastTurn = turn;
     if (!turn) break;
+
+    // --- repetition guard: identical consecutive turn = stuck model ---
+    const turnSig = turn.replace(/\s+/g, " ").trim().toLowerCase();
+    if (turnSig === lastTurnSig) {
+      turnRepeats++;
+    } else {
+      turnRepeats = 0;
+      lastTurnSig = turnSig;
+    }
+    if (turnRepeats >= 2) {
+      // Stuck: force one final briefing with tools forbidden
+      const forced = await routineChat([
+        ...history,
+        { role: "assistant", content: turn },
+        { role: "user", content: "STOP: you have repeated the same response without progress. Deliver your final briefing NOW based on what you already gathered. Do not emit any tool tags or delegations." },
+      ], { agent: agentId }, signal);
+      lastTurn = forced || turn;
+      break;
+    }
+    if (turnRepeats === 1) {
+      history = [
+        ...history,
+        { role: "assistant", content: turn },
+        { role: "user", content: "You just produced the exact same response again. Repeating it will not change the result. Try a different approach (for example, run [[LIST: Projects]] to find the correct path before [[READ]]), or deliver your final briefing now." },
+      ];
+      continue;
+    }
 
     // Delegation: run the specialist's own loop, then feed the result back
     const delegation = agentId === "zazu" ? [...turn.matchAll(DELEGATE_RE)][0] : null;
@@ -2288,10 +2475,18 @@ async function routineAgentLoop(agentId, task, extraSystem = "", signal) {
       const result = await runRoutineTool(m[1], m[2], "", agentId);
       results.push(`${m[1]}: ${m[2].trim()}\n${String(result).slice(0, 4000)}`);
     }
+    const callSig = [
+      ...(writeMatch ? [`WRITE:${writeMatch[1].trim().toLowerCase()}`] : []),
+      ...toolMatches.map((m) => `${m[1]}:${m[2].replace(/\s+/g, " ").trim().toLowerCase()}`),
+    ].join("|");
+    const repeatWarn = callSig === lastToolSig
+      ? "\n\nNOTE: these are the exact same tool calls as last turn. If they failed before, repeating them will not change the result — try a different approach (for example [[LIST: Projects]] to find the right path first), or deliver your final briefing now."
+      : "";
+    lastToolSig = callSig;
     history = [
       ...history,
       { role: "assistant", content: turn },
-      { role: "user", content: `TOOL RESULTS:\n${results.join("\n\n---\n\n").slice(0, 12000)}\n\nContinue. Either run the next tool tag(s), or deliver one concise final briefing.` },
+      { role: "user", content: `TOOL RESULTS:\n${results.join("\n\n---\n\n").slice(0, 12000)}${repeatWarn}\n\nContinue. Either run the next tool tag(s), or deliver one concise final briefing.` },
     ];
   }
   // Strip agent tags from the final text for storage
@@ -2403,7 +2598,7 @@ Write permissions: only Coder (AgenticOS code, Projects) and Scriber (Vault/Note
   const reply = await routineChat([
     { role: "system", content: system },
     { role: "user", content: description },
-  ]);
+  ], { agent: "zazu" });
   const match = reply.match(/```json\s*([\s\S]*?)```/i) || reply.match(/\{[\s\S]*\}/);
   if (!match) throw new Error("Zazu did not return a routine. Try describing it differently.");
   const spec = JSON.parse(match[1].replace(/^```json\s*|```\s*$/g, ""));
@@ -2533,6 +2728,9 @@ setTimeout(tickRoutines, 3000);
 const server = app.listen(PORT, LOCAL_HOST, () => {
   console.log(`Model proxy server on http://${LOCAL_HOST}:${PORT}`);
   console.log(`OpenRouter configured: ${Boolean(OPENROUTER_KEY)}`);
+  // RAG: build/refresh the Vault index in the background (cheap after first run
+  // — only changed files are re-embedded).
+  void rag.ensureIndexed();
 });
 
 export { server };

@@ -5,8 +5,8 @@
    one-click sync that re-fetches each provider's live free-model list.
    ========================================================================== */
 import { useCallback, useEffect, useState } from "react";
-import { fetchHealth, syncFreeModels, fmtContext } from "../utils/api";
-import { Activity, RefreshCw, RotateCw, CircleCheck, CircleX, CircleExclamationPoint, Timer, Zap } from "lucide-react";
+import { fetchHealth, syncFreeModels, fmtContext, ragStatus, ragReindex } from "../utils/api";
+import { Activity, RefreshCw, RotateCw, CircleCheck, CircleX, CircleExclamationPoint, Timer, Zap, BookOpen } from "lucide-react";
 import "./Health.css";
 
 const PROVIDER_INFO = {
@@ -72,6 +72,26 @@ export default function Health() {
       setSyncing(false);
     }
   }, [refresh]);
+
+  // RAG knowledge index state + manual reindex
+  const [rag, setRag] = useState(null);
+  const [ragIndexing, setRagIndexing] = useState(false);
+  const [ragError, setRagError] = useState("");
+  const ragRefresh = useCallback(async () => {
+    try { setRag(await ragStatus()); } catch (err) { setRagError(err.message || "RAG status failed"); }
+  }, []);
+  useEffect(() => { ragRefresh(); }, [ragRefresh]);
+  const runRagReindex = useCallback(async () => {
+    setRagIndexing(true);
+    setRagError("");
+    try {
+      setRag(await ragReindex(true));
+    } catch (err) {
+      setRagError(err.message || "Reindex failed");
+    } finally {
+      setRagIndexing(false);
+    }
+  }, []);
 
   if (loading) {
     return (
@@ -152,6 +172,28 @@ export default function Health() {
       </section>
 
       <div className="health-body">
+        {/* Knowledge index (RAG) */}
+        <section className="health-activity">
+          <h2><BookOpen /> Knowledge index (RAG)</h2>
+          {ragError && <p className="health-muted">RAG status unavailable: {ragError}</p>}
+          {!ragError && rag && (
+            <p className="health-muted">
+              {rag.ready
+                ? <>Vault indexed for semantic search: <b>{rag.totalChunks}</b> chunks from <b>{rag.filesIndexed}</b> files · model <b>{rag.model}</b>{rag.dim ? ` (${rag.dim}-dim)` : ""} · {rag.lastIndexed ? `updated ${relTime(Date.parse(rag.lastIndexed))}` : "never indexed"}</>
+                : "Index not built yet — press Reindex to embed the Vault."}
+              {rag.indexing ? " · indexing now…" : ""}
+            </p>
+          )}
+          <div className="health-actions" style={{ marginTop: 8 }}>
+            <button className="health-btn" onClick={runRagReindex} disabled={ragIndexing} title="Re-embed changed Vault files for semantic recall">
+              <RotateCw className={ragIndexing ? "spin" : ""} /> {ragIndexing ? "Indexing…" : "Reindex Vault"}
+            </button>
+          </div>
+          <p className="health-muted small">
+            The agent recalls this index automatically each turn (top passages injected into context) and via [[RECALL: query]].
+          </p>
+        </section>
+
         {/* What the models are working on */}
         <section className="health-activity">
           <h2><Zap /> Activity — what the models are working on</h2>

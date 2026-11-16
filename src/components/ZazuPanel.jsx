@@ -7,7 +7,7 @@
    Settings (persona, model, wake word, voice) are edited in the Agents tab.
    ========================================================================== */
 import { useState, useEffect, useRef, useCallback } from "react";
-import { streamChat, fsList, fsRead, fsWrite, fsRawUrl, bashShell, webSearch, webFetch, generateCloudImage, calendarList, calendarCreate, fetchProjects, readSkill, learnNote, fetchOverview, fetchMemory, createRoutineFromDescription, syncFreeModels } from "../utils/api";
+import { streamChat, fsList, fsRead, fsWrite, fsRawUrl, bashShell, webSearch, webFetch, generateCloudImage, calendarList, calendarCreate, fetchProjects, readSkill, learnNote, fetchOverview, fetchMemory, createRoutineFromDescription, syncFreeModels, ragQuery } from "../utils/api";
 import { isSttSupported, createWakeListener } from "../utils/stt";
 import { speak, stopTts, isTtsSupported, speakKokoro } from "../utils/tts";
 import Message from "./Message";
@@ -15,6 +15,7 @@ import { ZAZU, FUTURE_AGENTS, DELEGATE_RE, TOOL_RE, WRITE_RE, DETAILS_RE } from 
 import { loadAgentSettings, saveAgentSettings, SETTINGS_EVENT } from "../agents/settings";
 import { VAULT_OPEN_EVENT, VAULT_PENDING_KEY } from "../utils/vaultEvents";
 import { createDelegationConversation, updateDelegationConversation } from "../utils/delegationConversations";
+import { setAgentBusy } from "../utils/agentActivity";
 import { catalogLabel } from "../utils/api";
 import zazuAvatar from "../assets/zazu-avatar.jpg";
 import { Mic, Ear, Volume2, VolumeX, SquareStop, ClipboardList, HelpCircle, Trash2, Send, ChevronDown } from "lucide-react";
@@ -139,7 +140,7 @@ export default function ZazuPanel() {
 
   function systemPrompt(agentId = activeAgentRef.current, agentSettings = settingsRef.current) {
     const profile = agentId === "zazu"
-      ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "ASK", "LEARN", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC"] }
+      ? { ...ZAZU, status: "ready", tools: ["LIST", "READ", "ASK", "LEARN", "RECALL", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC"] }
       : FUTURE_AGENTS.find((agent) => agent.id === agentId);
     const base = agentSettings.system || profile?.system || "You are a helpful specialist agent.";
     let prompt = base;
@@ -181,7 +182,21 @@ export default function ZazuPanel() {
   }
 
   async function buildHistory(extra = []) {
-    const hist = [{ role: "system", content: await buildAgentSystemPrompt(activeAgentRef.current, settingsRef.current) }];
+    let prompt = await buildAgentSystemPrompt(activeAgentRef.current, settingsRef.current);
+    // RAG: auto-retrieve Vault passages relevant to the user's latest message.
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    if (lastUser && (lastUser.content || "").trim()) {
+      try {
+        const hits = await ragQuery(lastUser.content.trim(), 4);
+        const block = hits.map((h) => `### ${h.heading}  (source: Vault/${h.path})\n${h.text.slice(0, 900)}`).join("\n\n");
+        if (block) {
+          prompt += `\n\n--- RELEVANT KNOWLEDGE (auto-retrieved from the Vault by semantic search) ---\n${block}\nTreat this as reference context with sources; use [[RECALL]] for deeper searches and [[READ]] to verify anything critical.`;
+        }
+      } catch {
+        // Retrieval is best-effort: never block the turn on it.
+      }
+    }
+    const hist = [{ role: "system", content: prompt }];
     for (const m of messages) {
       if (m.role === "user") hist.push({ role: "user", content: m.content });
       else if (m.role === "agent" && m.raw) hist.push({ role: "assistant", content: m.raw });
@@ -235,6 +250,13 @@ export default function ZazuPanel() {
       await learnNote(arg.trim());
       setMemory((prev) => (prev ? prev + "\n" : "") + `- [just now] ${arg.trim()}`);
       return `Saved to memory: ${arg.trim()}`;
+    }
+    if (tool === "RECALL") {
+      const hits = await ragQuery(arg.trim(), 5);
+      if (!hits.length) return "RECALL: no matching Vault knowledge found.";
+      return hits
+        .map((h) => `— Vault/${h.path} · ${h.heading}\n${h.text.slice(0, 900)}`)
+        .join("\n\n");
     }
     if (tool === "NAVIGATE") {
       const [tabPart, ...rest] = arg.trim().split(":");
@@ -331,6 +353,7 @@ export default function ZazuPanel() {
     if (tool === "READ") return `Read ${arg.trim()}`;
     if (tool === "ASK") return `Asked: ${arg.trim()}`;
     if (tool === "LEARN") return `Learned: ${arg.trim()}`;
+    if (tool === "RECALL") return `Vault recall: ${arg.trim()}`;
     if (tool === "NAVIGATE") return `Navigated to ${arg.trim()} tab`;
     if (tool === "ROUTINE") return `Creating routine: ${arg.trim()}`;
     if (tool === "SYNC") return `Syncing free models`;
@@ -368,6 +391,7 @@ export default function ZazuPanel() {
       messages,
       temperature,
       fallbackChain,
+      agent: "zazu", // usage attribution on the server's health stats
       // An explicit fallback means primary â†’ second choice â†’ local. With no
       // explicit second choice the server tries its cloud alternatives first.
       customChain: fallback ? [primary, fallback, local].filter(Boolean) : null,
@@ -384,6 +408,15 @@ export default function ZazuPanel() {
     if (!profile || profile.status !== "ready") {
       return { ok: false, text: `${agentId} is not connected for task execution yet.` };
     }
+    setAgentBusy(agentId, true, "specialist");
+    try {
+      return await runSpecialistLoop(agentId, task, signal, delegationId);
+    } finally {
+      setAgentBusy(agentId, false, "specialist");
+    }
+  }
+
+  async function runSpecialistLoop(agentId, task, signal, delegationId) {
     const agentSettings = loadAgentSettings(agentId);
     let history = [
       { role: "system", content: await buildAgentSystemPrompt(agentId, agentSettings) },
@@ -394,6 +427,10 @@ export default function ZazuPanel() {
     const completedReads = new Set();
     let final = "";
     let reachedStepLimit = true;
+    // Repetition guards: break out when the model parrots the same turn.
+    let lastTurnSig = "";
+    let turnRepeats = 0;
+    let lastToolSig = "";
     const reportProgress = (activity) => {
       updateDelegationConversation({ delegationId, activity, status: "running" });
       setLedger((prev) => prev.map((entry) => entry.id === delegationId ? { ...entry, activity } : entry));
@@ -407,6 +444,28 @@ export default function ZazuPanel() {
       }
       const writeMatch = turn.match(WRITE_RE);
       const toolMatch = turn.match(TOOL_RE);
+
+      // --- repetition guard: identical consecutive turn = stuck model ---
+      const turnSig = turn.replace(/\s+/g, " ").trim().toLowerCase();
+      if (turnSig && turnSig === lastTurnSig) {
+        turnRepeats++;
+      } else {
+        turnRepeats = 0;
+        if (turnSig) lastTurnSig = turnSig;
+      }
+      if (turnRepeats >= 2) {
+        // Parroting a third time — stop; the forced report below takes over.
+        break;
+      }
+      if (turnRepeats === 1) {
+        history = [
+          ...history,
+          { role: "assistant", content: turn },
+          { role: "user", content: "You just produced the exact same response again. Repeating it will not change the result. Try a different approach (for example, run [[LIST: Projects]] to find the correct path before [[READ]]), or deliver your final report now." },
+        ];
+        continue;
+      }
+
       if (!toolMatch) {
         final = turn.replace(WRITE_RE, "").trim();
         reachedStepLimit = false;
@@ -428,12 +487,17 @@ export default function ZazuPanel() {
         }
         if (["LIST", "READ"].includes(tool) && !result.startsWith("TOOL ERROR:")) completedReads.add(readKey);
       }
+      const toolSig = `${tool}:${arg.replace(/\s+/g, " ").trim().toLowerCase()}`;
+      const repeatWarn = toolSig === lastToolSig
+        ? "\n\nNOTE: this is the exact same tool call as last turn. If it failed before, repeating it will not change the result — try a different approach, or deliver your final report now."
+        : "";
+      lastToolSig = toolSig;
       steps.push({ label, output: result.slice(0, 1200) });
       reportProgress(`Finished ${label}`);
       history = [
         ...history,
         { role: "assistant", content: turn },
-        { role: "user", content: `TOOL RESULT (${tool}: ${arg.trim()}):\n${result.slice(0, MAX_TOOL_RESULT)}\n\nContinue the task and report what actually succeeded.` },
+        { role: "user", content: `TOOL RESULT (${tool}: ${arg.trim()}):\n${result.slice(0, MAX_TOOL_RESULT)}${repeatWarn}\n\nContinue the task and report what actually succeeded.` },
       ];
     }
 
@@ -442,7 +506,7 @@ export default function ZazuPanel() {
         ...history,
         {
           role: "user",
-          content: "The tool-step budget is exhausted. Do not call or emit any more tools. Give the user a concise, honest status report now: what you verified, what you actually changed (if anything), and what remains. Do not claim completion unless a tool result confirms it.",
+          content: "The task loop was stopped (step budget exhausted or repeated actions without progress). Do not call or emit any more tools. Give the user a concise, honest status report now: what you verified, what you actually changed (if anything), and what remains. Do not claim completion unless a tool result confirms it.",
         },
       ];
       let reportTurn = "";
@@ -471,6 +535,7 @@ export default function ZazuPanel() {
     setIsStreaming(true);
     setStatus("working");
     stopTts();
+    setAgentBusy("zazu", true, "panel");
 
     addMessage("user", text);
     const agentMsg = addMessage("agent", "", { streaming: true, author: settingsRef.current.name || ZAZU.name });
@@ -484,6 +549,11 @@ export default function ZazuPanel() {
 
     try {
       history = await buildHistory([{ role: "user", content: text }]);
+      // Repetition guards: free models sometimes parrot the same turn (and the
+      // same failing tool call) forever — detect it and break the loop.
+      let lastTurnSig = "";
+      let turnRepeats = 0;
+      let lastToolSig = "";
       for (let i = 0; i < MAX_ITERATIONS; i++) {
         if (controller.signal.aborted) throw new DOMException("Stopped by user", "AbortError");
         // --- one model turn ---
@@ -496,7 +566,16 @@ export default function ZazuPanel() {
         })) {
           turn += chunk;
         }
-        raw += (raw ? "\n\n" : "") + turn;
+        // --- repetition guard: identical consecutive turn = stuck model ---
+        const turnSig = turn.replace(/\s+/g, " ").trim().toLowerCase();
+        const isRepeat = turnSig && turnSig === lastTurnSig;
+        if (isRepeat) {
+          turnRepeats++;
+        } else {
+          turnRepeats = 0;
+          if (turnSig) lastTurnSig = turnSig;
+          raw += (raw ? "\n\n" : "") + turn;
+        }
 
         if (modelNotes.length && steps.every((s) => s.label !== "Model availability")) {
           steps.push({ label: "Model availability", output: modelNotes.join("\n") });
@@ -505,6 +584,34 @@ export default function ZazuPanel() {
             streaming: true,
             thinking: renderSteps(steps),
           });
+        }
+
+        if (turnRepeats >= 2) {
+          // Parroting a third time: force one final report with tools forbidden
+          // instead of burning the rest of the step budget on the same response.
+          history = [...history, { role: "assistant", content: turn }];
+          let forced = "";
+          for await (const chunk of streamWithFallback({
+            messages: [...history, { role: "user", content: "STOP: you have repeated the same response without progress. Deliver your final report NOW based on what you already gathered. Do not emit any tool tags or delegations." }],
+            temperature: 0.6,
+            notes: modelNotes,
+            signal: controller.signal,
+          })) {
+            forced += chunk;
+          }
+          raw += (raw ? "\n\n" : "") + forced;
+          finalTurn = forced.trim() || turn;
+          break;
+        }
+        if (turnRepeats === 1) {
+          // Same response twice in a row: skip re-running the tools and tell
+          // the model to change course instead of parroting a third time.
+          history = [
+            ...history,
+            { role: "assistant", content: turn },
+            { role: "user", content: "You just produced the exact same response again. Repeating it will not change the result. Try a different approach (for example, run [[LIST: Projects]] to find the correct path before [[READ]]), or deliver your final report now." },
+          ];
+          continue;
         }
 
         // Dispatch specialist tags instead of leaving them as pending ledger entries.
@@ -580,12 +687,17 @@ export default function ZazuPanel() {
         }
 
         const [, tool, arg] = toolMatch;
+        const toolSig = `${tool}:${arg.replace(/\s+/g, " ").trim().toLowerCase()}`;
         let result;
         try {
           result = await runTool(tool, arg, writeMatch?.[2] || "");
         } catch (err) {
           result = `TOOL ERROR: ${err.message}`;
         }
+        const repeatWarn = toolSig === lastToolSig
+          ? "\n\nNOTE: this is the exact same tool call as last turn. If it failed before, repeating it will not change the result — try a different approach (for example [[LIST: Projects]] to find the right path first), or deliver your final report now."
+          : "";
+        lastToolSig = toolSig;
         steps.push({
           label: describeTool(tool, arg),
           output: result.slice(0, 1500),
@@ -603,7 +715,7 @@ export default function ZazuPanel() {
           {
             role: "user",
             content:
-              `${`TOOL RESULT (${tool}: ${arg.trim()}):\n${result.slice(0, MAX_TOOL_RESULT)}`}\n\n` +
+              `${`TOOL RESULT (${tool}: ${arg.trim()}):\n${result.slice(0, MAX_TOOL_RESULT)}`}${repeatWarn}\n\n` +
               (delegationResults.length ? `SPECIALIST RESULTS:\n${delegationResults.join("\n\n").slice(0, MAX_TOOL_RESULT)}\n\n` : "") +
               `Continue. Either run the next single tool tag, or deliver one concise final report of what was completed.`,
           },
@@ -666,6 +778,7 @@ export default function ZazuPanel() {
       }
     } finally {
       if (activeRequestRef.current === controller) activeRequestRef.current = null;
+      setAgentBusy("zazu", false, "panel");
     }
   }
   useEffect(() => {

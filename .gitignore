@@ -27,6 +27,9 @@ logs/
 *.db
 *.local
 
+# RAG vector index — contains chunks of the personal Vault, never publish
+server/rag-index/
+
 # Operating system and editor files
 .DS_Store
 Thumbs.db

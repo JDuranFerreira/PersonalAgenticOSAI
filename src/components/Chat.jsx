@@ -12,6 +12,7 @@ import {
   streamChat, fetchModels, readSkill, fsList, fsRead, fsWrite, bashShell, webSearch, webFetch,
   fetchProjects, learnNote, calendarList, calendarCreate, createRoutineFromDescription,
   syncFreeModels, generateCloudImage, fsRawUrl, MODELS, fetchModelCatalog, onCatalogInvalidated,
+  ragQuery,
 } from "../utils/api";
 import { prepareAttachment } from "../utils/attachments";
 import Message from "./Message";
@@ -24,6 +25,7 @@ import { ZAZU, FUTURE_AGENTS, TOOL_RE, WRITE_RE, DELEGATE_RE, ZAZU_FAST_MODELS, 
 import { loadAgentSettings, saveAgentSettings, SETTINGS_EVENT } from "../agents/settings";
 import { CONVERSATIONS_UPDATED_EVENT } from "../utils/delegationConversations";
 import { VAULT_OPEN_EVENT, VAULT_PENDING_KEY } from "../utils/vaultEvents";
+import { setAgentBusy } from "../utils/agentActivity";
 import ResizeHandle from "./ResizeHandle";
 import { useResizableWidth } from "../utils/useResizableWidth";
 import { Mic, MicOff, Speaker, VolumeOff, SquareStop, RefreshCw } from "lucide-react";
@@ -32,7 +34,10 @@ const STORAGE_KEY = "agentic_os_conversations";
 const ACTIVE_AGENT_KEY = "agentic_os_chat_agent";
 const CHAT_TOOL_LIMIT = 35;
 const MAX_CHAT_TOOL_RESULT = 4000;
-const ZAZU_CHAT_TOOLS = ["LIST", "READ", "ASK", "LEARN", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC", "BASH"];
+// Window the transcript sent to the model: unbounded history eventually
+// breaks the provider's context limit and slows every turn.
+const MAX_HISTORY_MESSAGES = 30;
+const ZAZU_CHAT_TOOLS = ["LIST", "READ", "ASK", "LEARN", "RECALL", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC", "BASH"];
 const CHAT_VALID_TABS = ["chat", "agents", "health", "routines", "vault", "calendar", "skills", "projects", "security"];
 const NAVIGATE_EVENT = "agentic_os_navigate";
 
@@ -81,6 +86,20 @@ function persistableMessages(messages) {
 function titleFromMessage(text) {
   const compact = String(text || "New conversation").replace(/\s+/g, " ").trim();
   return compact.length > 48 ? `${compact.slice(0, 45)}…` : compact || "New conversation";
+}
+
+// Plain text of a message's model-facing content (a multipart array when
+// images are attached) — safe for RAG queries and history rebuilds.
+function messageText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.filter((p) => p?.type === "text").map((p) => p.text).join("\n");
+  return "";
+}
+
+// Compact transcript entry for the collapsible working log
+function compactTurn(text) {
+  const t = stripToolTags(text);
+  return t.length > 400 ? `${t.slice(0, 400)}…` : t;
 }
 
 // Remove tool tags from displayed text; tool results live in the working log.
@@ -289,13 +308,19 @@ export default function Chat() {
     }));
   }, [activeId, messages, selectedAgentId, selectedModel]);
 
+  // Persist to localStorage debounced: updateMessage fires per streamed chunk,
+  // and stringifying the whole conversation list per chunk caused jank and
+  // quota pressure on long histories.
   useEffect(() => {
     if (!conversations.length) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
-    } catch (error) {
-      console.warn("Conversation history could not be saved:", error.message);
-    }
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+      } catch (error) {
+        console.warn("Conversation history could not be saved:", error.message);
+      }
+    }, 800);
+    return () => clearTimeout(t);
   }, [conversations]);
 
   // ---------- Scroll to bottom ----------
@@ -465,6 +490,7 @@ export default function Chat() {
     if (tool === "READ") return `Read ${arg.trim()}`;
     if (tool === "ASK") return `Asked: ${arg.trim()}`;
     if (tool === "LEARN") return `Learned: ${arg.trim()}`;
+    if (tool === "RECALL") return `Vault recall: ${arg.trim()}`;
     if (tool === "NAVIGATE") return `Navigated to ${arg.trim()} tab`;
     if (tool === "ROUTINE") return `Creating routine: ${arg.trim()}`;
     if (tool === "SYNC") return "Syncing free models";
@@ -504,6 +530,13 @@ export default function Chat() {
       if (tool === "LEARN") {
         await learnNote(arg.trim());
         return `Saved to memory: ${arg.trim()}`;
+      }
+      if (tool === "RECALL") {
+        const hits = await ragQuery(arg.trim(), 5);
+        if (!hits.length) return "RECALL: no matching Vault knowledge found.";
+        return hits
+          .map((h) => `— Vault/${h.path} · ${h.heading}\n${h.text.slice(0, 900)}`)
+          .join("\n\n");
       }
       if (tool === "NAVIGATE") {
         const [tabPart, ...rest] = arg.trim().split(":");
@@ -600,7 +633,10 @@ export default function Chat() {
   // ---------- Build message history for the AI ----------
   // `extra` carries messages that are not yet in state (setMessages is async,
   // so the closure's `messages` is stale right after addMessage()).
-  async function buildHistory(extra = []) {
+  // `ragSourceText` is the just-typed message for the RAG query — passing it
+  // explicitly is required for the same staleness reason, otherwise the query
+  // would run against the PREVIOUS user message.
+  async function buildHistory(extra = [], ragSourceText = null) {
     const profile = selectedAgentId === "zazu" ? ZAZU : FUTURE_AGENTS.find((agent) => agent.id === selectedAgentId);
     const basePrompt = agentSettings.system || profile?.system || `You are ${agentSettings.name}, a helpful tutor and assistant.`;
     const tools = selectedAgentId === "zazu" ? ZAZU_CHAT_TOOLS : (profile?.tools || []);
@@ -619,11 +655,29 @@ export default function Chat() {
     const skillPrompt = skillNotes.length
       ? `\n\n--- ASSIGNED SKILLS ---\n${skillNotes.join("\n\n")}\n\nSkills are reference knowledge only and do not grant tools or permissions.`
       : "";
+    // RAG: auto-retrieve Vault passages relevant to the user's latest message.
+    const lastUser = ragSourceText ? null : [...messages].reverse().find((m) => m.role === "user");
+    const ragQueryText = String(ragSourceText || (lastUser ? (messageText(lastUser.modelContent) || lastUser.content || "") : "")).trim();
+    let ragPrompt = "";
+    if (ragQueryText) {
+      const q = ragQueryText;
+      if (q) {
+        try {
+          const hits = await ragQuery(q, 4);
+          const block = hits.map((h) => `### ${h.heading}  (source: Vault/${h.path})\n${h.text.slice(0, 900)}`).join("\n\n");
+          if (block) {
+            ragPrompt = `\n\n--- RELEVANT KNOWLEDGE (auto-retrieved from the Vault by semantic search) ---\n${block}\nTreat this as reference context with sources; use [[RECALL]] for deeper searches and [[READ]] to verify anything critical.`;
+          }
+        } catch {
+          // Retrieval is best-effort: never block the turn on it.
+        }
+      }
+    }
     const hist = [];
     hist.push({
       role: "system",
       content:
-        `You are ${agentSettings.name}, a ${agentSettings.role} in Agentic OS. Follow this agent profile:\n\n${basePrompt}${skillPrompt}\n\n` +
+        `You are ${agentSettings.name}, a ${agentSettings.role} in Agentic OS. Follow this agent profile:\n\n${basePrompt}${skillPrompt}${ragPrompt}\n\n` +
         `${toolPolicy} ` +
         "Never claim to have changed files, sent messages, searched the web, or performed external work unless the relevant tool returned success. " +
         "You are running inside a futuristic local chat interface. " +
@@ -632,9 +686,12 @@ export default function Chat() {
         "If you need consent before continuing, include a tag on its own line like [ACTION: short description] and wait. " +
         "Approval continues the turn with your scoped tools available; it does not bypass their permission limits.",
     });
-    for (const m of messages) {
+    const recent = messages
+      .filter((m) => m.role === "user" || m.role === "agent")
+      .slice(-MAX_HISTORY_MESSAGES);
+    for (const m of recent) {
       if (m.role === "user") {
-        hist.push({ role: "user", content: m.modelContent || m.content });
+        hist.push({ role: "user", content: messageText(m.modelContent) || m.content });
       } else if (m.role === "agent") {
         hist.push({ role: "assistant", content: m.content });
       }
@@ -650,10 +707,64 @@ export default function Chat() {
   async function executeToolTurns({ assistantMessage, initialContent, history, controller, onStreamed }) {
     let content = initialContent;
     const toolSteps = [];
+    const toolTurns = []; // compact transcript of intermediate model turns
     const toolHistory = [...history];
-    const workingLog = () => `**Working**\n\n${toolSteps.map((s) => `- ${s}`).join("\n")}`;
+    // Repetition guards: free models sometimes parrot the same turn (and the
+    // same failing tool call) forever — detect it and break the loop.
+    let lastTurnSig = "";
+    let turnRepeats = 0;
+    let lastToolSig = "";
+    const workingLog = () =>
+      `**Working**\n\n${toolSteps.map((s) => `- ${s}`).join("\n")}` +
+      (toolTurns.length ? `\n\n**Turn transcript**\n\n${toolTurns.join("\n\n")}` : "");
 
     for (let iteration = 0; iteration < CHAT_TOOL_LIMIT; iteration++) {
+      // --- repetition guard: identical consecutive turn = stuck model ---
+      const turnSig = content.replace(/\s+/g, " ").trim().toLowerCase();
+      if (turnSig === lastTurnSig) {
+        turnRepeats++;
+      } else {
+        turnRepeats = 0;
+        lastTurnSig = turnSig;
+      }
+      if (turnRepeats >= 2) {
+        // Parroting a third time: force one final answer with tools forbidden
+        // instead of burning the rest of the step budget on the same response.
+        toolHistory.push({ role: "assistant", content });
+        content = await typeWriter(
+          (stepContent) => {
+            onStreamed?.(stepContent);
+            updateMessage(assistantMessage.id, { content: stripToolTags(stepContent), thinking: workingLog(), streaming: true });
+          },
+          streamChat({
+            model: selectedModel,
+            messages: [...toolHistory, { role: "user", content: "STOP: you have repeated the same response without progress. Give your final answer NOW based on what you already have. Do not emit any tool tags." }],
+            temperature: 0.3,
+            signal: controller.signal,
+          }),
+        );
+        break;
+      }
+      if (turnRepeats === 1) {
+        // Same response twice in a row: skip re-running the tools and tell the
+        // model to change course instead of parroting a third time.
+        toolHistory.push({ role: "assistant", content });
+        toolHistory.push({ role: "user", content: "You just produced the exact same response again. Repeating it will not change the result. Try a different approach, or give your final answer without tool tags now." });
+        content = await typeWriter(
+          (stepContent) => {
+            onStreamed?.(stepContent);
+            updateMessage(assistantMessage.id, { content: stripToolTags(stepContent), thinking: workingLog(), streaming: true });
+          },
+          streamChat({
+            model: selectedModel,
+            messages: toolHistory,
+            temperature: 0.4,
+            signal: controller.signal,
+          }),
+        );
+        continue;
+      }
+
       // Delegation is a task-panel feature; Chat declines it cleanly.
       if (content.includes("[DELEGATE:") && !TOOL_RE.test(content)) {
         const cleaned = content.replace(DELEGATE_RE, "").trim();
@@ -666,8 +777,10 @@ export default function Chat() {
 
       const writeMatch = content.match(WRITE_RE);
       const [, tool, arg] = toolMatch;
+      const toolSig = `${tool}:${arg.replace(/\s+/g, " ").trim().toLowerCase()}`;
       const label = describeChatTool(tool, arg);
       toolSteps.push(label);
+      toolTurns.push(compactTurn(content));
       setStatus("working");
       updateMessage(assistantMessage.id, {
         content: stripToolTags(content),
@@ -676,16 +789,20 @@ export default function Chat() {
       });
 
       const result = await runChatTool(tool, arg, writeMatch?.[2] || "");
+      const repeatWarn = toolSig === lastToolSig
+        ? "\n\nNOTE: this is the exact same tool call as last turn. If it failed before, repeating it will not change the result — try a different approach, or give your final answer without tool tags now."
+        : "";
+      lastToolSig = toolSig;
       toolHistory.push({ role: "assistant", content });
       toolHistory.push({
         role: "user",
-        content: `TOOL RESULT (${tool}) — context for you only, do not repeat it verbatim:\n${result.slice(0, MAX_CHAT_TOOL_RESULT)}\n\nContinue: use this result, call another tool, or give your final answer without tool tags.`,
+        content: `TOOL RESULT (${tool}) — context for you only, do not repeat it verbatim:\n${result.slice(0, MAX_CHAT_TOOL_RESULT)}${repeatWarn}\n\nContinue: use this result, call another tool, or give your final answer without tool tags.`,
       });
 
       const nextGenerator = streamChat({
         model: selectedModel,
         messages: toolHistory,
-        temperature: 0.7,
+        temperature: 0.4,
         signal: controller.signal,
       });
       content = await typeWriter(
@@ -705,7 +822,7 @@ export default function Chat() {
       // Step budget reached while the agent still wanted tools: say so.
       content = `${stripToolTags(content)}\n\n_(I reached the in-chat tool-step limit before finishing. Narrow the request or send a follow-up message to continue.)_`;
     }
-    return { content, toolSteps };
+    return { content, toolSteps, workingLog: workingLog() };
   }
 
   // ---------- Send user message ----------
@@ -736,15 +853,19 @@ export default function Chat() {
     const assistantMessage = addMessage("agent", "", { streaming: true, author: agentSettings.name });
     const controller = new AbortController();
     requestControllerRef.current = controller;
+    setAgentBusy(selectedAgentId, true, "chat");
     let streamedContent = "";
-    const history = await buildHistory([{ role: "user", content: modelContent }]);
+    // The RAG query must use the message just typed — `messages` state is
+    // stale right now (addMessage above hasn't re-rendered yet).
+    const ragSource = typeof modelContent === "string" ? modelContent : (modelContent[0]?.text || displayText);
+    const history = await buildHistory([{ role: "user", content: modelContent }], ragSource);
 
     // Stream the AI response
     try {
       const generator = streamChat({
         model: selectedModel,
         messages: history,
-        temperature: 0.7,
+        temperature: 0.6,
         signal: controller.signal,
       });
 
@@ -759,7 +880,7 @@ export default function Chat() {
       // ---------- Tool loop ----------
       // If the agent's reply carries a tool tag, execute it with the agent's
       // scoped tools and give the model the result for its next turn.
-      const { content, toolSteps } = await executeToolTurns({
+      const { content, toolSteps, workingLog } = await executeToolTurns({
         assistantMessage,
         initialContent: rendered,
         history,
@@ -784,7 +905,7 @@ export default function Chat() {
       // No action — finalize
       updateMessage(assistantMessage.id, {
         content: stripToolTags(content),
-        thinking: toolSteps.length ? `**Working**\n\n${toolSteps.map((s) => `- ${s}`).join("\n")}` : undefined,
+        thinking: toolSteps.length ? workingLog : undefined,
         streaming: false,
       });
       setIsStreaming(false);
@@ -806,6 +927,7 @@ export default function Chat() {
       setIsStreaming(false);
     } finally {
       if (requestControllerRef.current === controller) requestControllerRef.current = null;
+      setAgentBusy(selectedAgentId, false, "chat");
     }
   }
 
@@ -831,18 +953,20 @@ export default function Chat() {
     const assistantMessage = addMessage("agent", "", { streaming: true, author: agentSettings.name });
     const controller = new AbortController();
     requestControllerRef.current = controller;
+    setAgentBusy(selectedAgentId, true, "chat");
     try {
       const history = await buildHistory();
       const generator = streamChat({
         model: selectedModel,
         messages: [...history, { role: "user", content: decision }],
+        temperature: 0.6,
         signal: controller.signal,
       });
       const rendered = await typeWriter(
         (content) => updateMessage(assistantMessage.id, { content, streaming: true }),
         generator,
       );
-      const { content, toolSteps } = await executeToolTurns({
+      const { content, toolSteps, workingLog } = await executeToolTurns({
         assistantMessage,
         initialContent: rendered,
         history: [...history, { role: "user", content: decision }],
@@ -850,7 +974,7 @@ export default function Chat() {
       });
       updateMessage(assistantMessage.id, {
         content: stripToolTags(content),
-        thinking: toolSteps.length ? `**Working**\n\n${toolSteps.map((s) => `- ${s}`).join("\n")}` : undefined,
+        thinking: toolSteps.length ? workingLog : undefined,
         streaming: false,
       });
       setIsStreaming(false);
@@ -866,6 +990,7 @@ export default function Chat() {
       setIsStreaming(false);
     } finally {
       if (requestControllerRef.current === controller) requestControllerRef.current = null;
+      setAgentBusy(selectedAgentId, false, "chat");
     }
   }
 

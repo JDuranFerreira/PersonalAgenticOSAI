@@ -2087,6 +2087,11 @@ body.resizing .resize-handle {
 .agent-dot.speaking { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
 .agent-dot.listening { background: var(--magenta); box-shadow: 0 0 8px var(--magenta); animation: pulse-neon 1.2s infinite; }
 
+.model-test-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.model-test-result { font-size: 0.72rem; font-family: ui-monospace, monospace; }
+.model-test-result.ok { color: var(--green); }
+.model-test-result.fail { color: var(--amber); word-break: break-word; }
+
 .agent-card-body {
   min-width: 0;
 }

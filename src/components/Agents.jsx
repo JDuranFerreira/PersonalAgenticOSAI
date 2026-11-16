@@ -9,7 +9,8 @@ import { useState, useEffect } from "react";
 import { ZAZU, FUTURE_AGENTS } from "../agents/zazu";
 import { loadAgentSettings, saveAgentSettings, resetAgentSettings } from "../agents/settings";
 import ModelSelect from "./ModelSelect";
-import { catalogLabel, fetchImageModels, fetchSkills } from "../utils/api";
+import { catalogLabel, fetchImageModels, fetchSkills, fetchRoutines, streamChat } from "../utils/api";
+import { AGENT_ACTIVITY_EVENT } from "../utils/agentActivity";
 import zazuAvatar from "../assets/zazu-avatar.jpg";
 import ResizeHandle from "./ResizeHandle";
 import { useResizableWidth } from "../utils/useResizableWidth";
@@ -17,11 +18,14 @@ import { kokoroHealth, speak, speakKokoro, isTtsSupported, getVoices } from "../
 import { Bot, Search, Code, Image as ImageIcon, RotateCcw, Check, FileText, Globe, GraduationCap, BookOpen, Wrench, ArrowUpRight } from "lucide-react";
 
 const FUTURE_ICONS = { search: <Search size={15} />, code: <Code size={15} />, image: <ImageIcon size={15} />, fileText: <FileText size={15} />, globe: <Globe size={15} />, "graduation-cap": <GraduationCap size={17} /> };
-const ZAZU_TOOLS = ["LIST", "READ", "ASK", "LEARN", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC"];
+// Matches Chat's actual Zazu allow-list (ZAZU_CHAT_TOOLS) so the UI shows the
+// real permissions — previously RECALL and BASH were hidden here.
+const ZAZU_TOOLS = ["LIST", "READ", "ASK", "LEARN", "RECALL", "NAVIGATE", "CALENDAR", "REMIND", "PROJECTS", "ROUTINE", "SYNC", "BASH"];
 const TOOL_LABELS = {
   LIST: "Browse files", READ: "Read files", ASK: "Ask you questions", WRITE: "Save files",
   SEARCH: "Web search", FETCH: "Read web pages", IMAGE: "Create images", NAVIGATE: "Navigate tabs",
   CALENDAR: "Read calendar", REMIND: "Create reminders", PROJECTS: "Inspect projects", ROUTINE: "Create routines", SYNC: "Sync models", LEARN: "Update memory",
+  RECALL: "Search Vault memory", BASH: "Run shell commands",
 };
 
 // Small live indicator: is the local Kokoro voice service running?
@@ -45,6 +49,17 @@ function VoiceHealth() {
 export default function Agents() {
   const [selectedAgentId, setSelectedAgentId] = useState("zazu");
   const [settings, setSettings] = useState(() => loadAgentSettings(selectedAgentId));
+  // All agents' settings, loaded once into state — reading localStorage during
+  // every render was wasteful and went stale when the panel saved settings.
+  const [allSettings, setAllSettings] = useState(() => {
+    const map = { zazu: loadAgentSettings("zazu") };
+    for (const agent of FUTURE_AGENTS) map[agent.id] = loadAgentSettings(agent.id);
+    return map;
+  });
+  const [busyAgents, setBusyAgents] = useState({});   // streaming/working right now (client)
+  const [routineBusy, setRoutineBusy] = useState({}); // running a scheduled routine (server)
+  const [testingModel, setTestingModel] = useState(false);
+  const [testResult, setTestResult] = useState(null); // { ok, text }
   const [saved, setSaved] = useState(false);
   const [imageModels, setImageModels] = useState([]);
   const [imageProviderConfigured, setImageProviderConfigured] = useState(false);
@@ -59,12 +74,13 @@ export default function Agents() {
     ? "Coordinates specialists, reads the Vault and project summaries, and manages reminders, routines, and model sync."
     : selectedProfile?.toolScope;
   const selectedSkills = settings.skills || [];
-  const zazuSettings = loadAgentSettings("zazu");
+  const zazuSettings = allSettings.zazu;
 
   function selectAgent(agentId) {
     setSelectedAgentId(agentId);
     setSettings(loadAgentSettings(agentId));
     setSkillsError("");
+    setTestResult(null);
   }
 
   // Resizable roster rail (drag its right edge)
@@ -110,6 +126,83 @@ export default function Agents() {
     return () => { alive = false; };
   }, []);
 
+  // Keep every agent's snapshot in sync when settings change anywhere
+  // (this editor, the Zazu panel, or a Chat model switch).
+  useEffect(() => {
+    const reload = () => {
+      const map = { zazu: loadAgentSettings("zazu") };
+      for (const agent of FUTURE_AGENTS) map[agent.id] = loadAgentSettings(agent.id);
+      setAllSettings(map);
+      setSettings(loadAgentSettings(selectedAgentId));
+    };
+    window.addEventListener(SETTINGS_EVENT, reload);
+    return () => window.removeEventListener(SETTINGS_EVENT, reload);
+  }, [selectedAgentId]);
+
+  // Live busy dots: which agents are streaming/working right now
+  useEffect(() => {
+    const onActivity = (event) => {
+      const { agentId, busy } = event.detail || {};
+      if (!agentId) return;
+      setBusyAgents((prev) => (prev[agentId] === busy ? prev : { ...prev, [agentId]: busy }));
+    };
+    window.addEventListener(AGENT_ACTIVITY_EVENT, onActivity);
+    return () => window.removeEventListener(AGENT_ACTIVITY_EVENT, onActivity);
+  }, []);
+
+  // Scheduled routines running server-side also count as "busy"
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const data = await fetchRoutines();
+        if (!alive) return;
+        const running = {};
+        for (const r of data.running || []) running[r.agent || "zazu"] = true;
+        setRoutineBusy(running);
+      } catch { /* server down — keep the last known state */ }
+    };
+    poll();
+    const t = setInterval(poll, 10000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
+  function dotClass(agentId) {
+    return busyAgents[agentId] || routineBusy[agentId] ? "working" : "idle";
+  }
+
+  // Ping the selected primary model with a single-model chain so a failure
+  // reports the truth instead of silently falling back to another model.
+  async function testModel() {
+    if (!settings.model || testingModel) return;
+    setTestingModel(true);
+    setTestResult(null);
+    const started = performance.now();
+    const controller = new AbortController();
+    try {
+      let responded = false;
+      for await (const chunk of streamChat({
+        model: settings.model,
+        customChain: [settings.model],
+        messages: [{ role: "user", content: "Reply with just: OK" }],
+        maxTokens: 8,
+        temperature: 0,
+        signal: controller.signal,
+      })) {
+        if (typeof chunk === "string" && chunk.trim()) { responded = true; break; }
+      }
+      const ms = Math.round(performance.now() - started);
+      setTestResult(responded
+        ? { ok: true, text: `OK — responded in ${ms} ms` }
+        : { ok: false, text: "No content returned" });
+    } catch (err) {
+      setTestResult({ ok: false, text: err.message || String(err) });
+    } finally {
+      controller.abort();
+      setTestingModel(false);
+    }
+  }
+
   function toggleSkill(slug) {
     const current = settings.skills || [];
     if (!current.includes(slug) && current.length >= 8) {
@@ -128,6 +221,7 @@ export default function Agents() {
     const next = { ...settings, ...patch };
     setSettings(next);
     saveAgentSettings(selectedAgentId, next);
+    setAllSettings((prev) => ({ ...prev, [selectedAgentId]: next }));
     setSaved(true);
     setTimeout(() => setSaved(false), 1200);
   }
@@ -144,7 +238,7 @@ export default function Agents() {
         >
           <div className="agent-avatar zazu">
             <img className="zazu-img" src={zazuAvatar} alt="Zazu" />
-            <span className="agent-dot idle" />
+            <span className={`agent-dot ${dotClass("zazu")}`} title={dotClass("zazu") === "working" ? "Working right now" : "Idle"} />
           </div>
           <div className="agent-card-body">
             <div className="agent-card-name">{zazuSettings.name}</div>
@@ -162,13 +256,16 @@ export default function Agents() {
           >
             <div className={`agent-avatar agent-avatar-${a.id}`}>
               {FUTURE_ICONS[a.icon] || <Bot size={15} />}
+              {a.status === "ready" && (
+                <span className={`agent-dot ${dotClass(a.id)}`} title={dotClass(a.id) === "working" ? "Working right now" : "Idle"} />
+              )}
             </div>
             <div className="agent-card-body">
               <div className="agent-card-name">{a.name}</div>
               <div className="agent-card-role">
                 {a.role} · {a.status === "ready" ? `${a.tools?.length || 0} scoped tools` : "chat only"}
               </div>
-              {a.status === "ready" && <div className="agent-card-model">{loadAgentSettings(a.id).skills?.length || 0} skills assigned</div>}
+              {a.status === "ready" && <div className="agent-card-model">{allSettings[a.id]?.skills?.length || 0} skills assigned</div>}
             </div>
           </button>
         ))}
@@ -201,8 +298,10 @@ export default function Agents() {
             <button
               className="btn btn-outline"
               onClick={() => {
+                if (!window.confirm(`Reset ${settings.name}'s settings to defaults? This restores the original persona, model chain, and skill assignments.`)) return;
                 const d = resetAgentSettings(selectedAgentId);
                 setSettings(d);
+                setAllSettings((prev) => ({ ...prev, [selectedAgentId]: d }));
               }}
               title={selectedAgentId === "zazu" 
                 ? "Restore Zazu's original settings" 
@@ -294,6 +393,22 @@ export default function Agents() {
               value={settings.model}
               onChange={(model) => update({ model })}
             />
+            <div className="model-test-row">
+              <button
+                type="button"
+                className="btn btn-outline"
+                onClick={testModel}
+                disabled={testingModel || !settings.model}
+                title="Send a tiny request to this exact model (no fallback) and report the result"
+              >
+                {testingModel ? "Testing…" : "Test model"}
+              </button>
+              {testResult && (
+                <span className={`model-test-result ${testResult.ok ? "ok" : "fail"}`}>
+                  {testResult.ok ? "✓" : "✗"} {testResult.text}
+                </span>
+              )}
+            </div>
             <p className="settings-hint">
               The selected profile uses this model in Chat and in the right-side task panel.
             </p>

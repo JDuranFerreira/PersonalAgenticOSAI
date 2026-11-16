@@ -24,12 +24,13 @@ export async function* streamChat({
   fallbackChain = "default",
   customChain = null,
   localModel,
+  agent,
   signal,
 }) {
   const res = await fetch(`${PROXY_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, stream: true, temperature, max_tokens: maxTokens, fallbackChain, customChain, localModel }),
+    body: JSON.stringify({ model, messages, stream: true, temperature, max_tokens: maxTokens, fallbackChain, customChain, localModel, agent }),
     signal,
   });
 
@@ -143,6 +144,32 @@ export async function syncFreeModels() {
   catalogCache = null; // force the model dropdowns to re-fetch the updated catalog
   for (const fn of catalogListeners) { try { fn(); } catch { /* listener errors must not break sync */ } }
   return data;
+}
+
+// ---------------------------------------------------------------------------
+// RAG: semantic retrieval over the Vault (server does vector+BM25 hybrid)
+// ---------------------------------------------------------------------------
+export async function ragStatus() {
+  const res = await fetch(`${PROXY_URL}/api/rag/status`);
+  if (!res.ok) throw new Error(`RAG status failed ${res.status}`);
+  return res.json();
+}
+
+export async function ragReindex(force = false) {
+  const res = await fetch(`${PROXY_URL}/api/rag/reindex`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ force }),
+  });
+  if (!res.ok) throw new Error(`RAG reindex failed ${res.status}`);
+  return res.json();
+}
+
+export async function ragQuery(q, k = 5) {
+  const res = await fetch(`${PROXY_URL}/api/rag/query?q=${encodeURIComponent(q)}&k=${k}`);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `RAG query failed ${res.status}`);
+  return data.results || [];
 }
 
 // ---------------------------------------------------------------------------
@@ -352,13 +379,22 @@ export async function fetchSkills() {
   return data;
 }
 
+// Skills are read on every message send (buildHistory) — cache them briefly so
+// repeat sends don't re-fetch up to 8 SKILL.md files each time.
+const skillCache = new Map(); // key -> { at, data }
+const SKILL_CACHE_MS = 10 * 60 * 1000;
+
 export async function readSkill(slug, scope = "installed", group = "") {
+  const key = `${scope}:${group}:${slug}`;
+  const hit = skillCache.get(key);
+  if (hit && Date.now() - hit.at < SKILL_CACHE_MS) return hit.data;
   const route = scope === "library"
     ? `/api/skills/library/${encodeURIComponent(group)}/${encodeURIComponent(slug)}`
     : `/api/skills/installed/${encodeURIComponent(slug)}`;
   const res = await fetch(`${PROXY_URL}${route}`);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `Skill read failed ${res.status}`);
+  skillCache.set(key, { at: Date.now(), data });
   return data;
 }
 
@@ -370,6 +406,7 @@ export async function installSkill(group, slug) {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `Skill install failed ${res.status}`);
+  skillCache.clear(); // a skill may have just been added/updated
   return data;
 }
 
@@ -435,7 +472,6 @@ const MODELS = [
   { id: "openrouter/baidu/ernie-5.5-flash-preview:free", label: "Ernie 5.5 Flash", provider: "openrouter", context: 1024000 },
   { id: "openrouter/cohere/north-mini-code:free", label: "North Mini Code", provider: "openrouter", context: 256000 },
   { id: "openrouter/liquid/lfm-3-1.7b:free", label: "LFM 3 1.7B", provider: "openrouter", context: 262144 },
-  { id: "openrouter/liquid/lfm-2.5-2.6b:free", label: "LFM 2.5 2.6B", provider: "openrouter", context: 65536 },
   { id: "openrouter/recursive/flint-v1.0:free", label: "Flint v1.0", provider: "openrouter", context: 262144 },
   { id: "openrouter/openrouter/free", label: "OpenRouter Free (auto)", provider: "openrouter", context: 200000, vision: true },
   { id: "ollama/qwen3:8b", label: "Qwen3 8B (local Ollama)", provider: "ollama", context: 32768 },

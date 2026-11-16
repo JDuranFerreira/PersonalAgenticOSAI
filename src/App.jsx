@@ -4,6 +4,7 @@
    ========================================================================== */
 import { useState, useEffect } from "react";
 import Chat from "./components/Chat";
+import Home from "./components/Home";
 import Agents from "./components/Agents";
 import Health from "./components/Health";
 import Vault from "./components/Vault";
@@ -16,12 +17,12 @@ import ZazuPanel from "./components/ZazuPanel";
 import ResizeHandle from "./components/ResizeHandle";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { useResizableWidth } from "./utils/useResizableWidth";
-import { MessageSquare, Bot, FolderOpen, CalendarDays, Puzzle, Code2, Activity, Repeat, ShieldCheck } from "lucide-react";
+import { Home as HomeIcon, MessageSquare, Bot, FolderOpen, CalendarDays, Puzzle, Code2, Activity, Repeat, ShieldCheck } from "lucide-react";
 
 const NAVIGATE_EVENT = "agentic_os_navigate";
 
 export default function App() {
-  const [tab, setTab] = useState("chat");
+  const [tab, setTab] = useState("home");
   const rightRail = useResizableWidth({
     storageKey: "agentic_os_width_right_rail",
     defaultValue: 400,
@@ -34,7 +35,7 @@ export default function App() {
   useEffect(() => {
     const handleNavigate = (e) => {
       const targetTab = e.detail?.tab;
-      const validTabs = ["chat", "agents", "health", "routines", "vault", "calendar", "skills", "projects", "security", "settings"];
+      const validTabs = ["home", "chat", "agents", "health", "routines", "vault", "calendar", "skills", "projects", "security", "settings"];
       if (targetTab && validTabs.includes(targetTab)) {
         setTab(targetTab);
       }
@@ -53,6 +54,14 @@ export default function App() {
       {/* Left nav rail with tabs */}
       <nav className="nav-rail">
         <div className="rail-brand" title="Agentic OS">&#9678;</div>
+        <button
+          className={`rail-tab ${tab === "home" ? "active" : ""}`}
+          title="Home — today at a glance"
+          onClick={() => setTab("home")}
+        >
+          <HomeIcon />
+          <span>Home</span>
+        </button>
         <button
           className={`rail-tab ${tab === "chat" ? "active" : ""}`}
           title="Chat"
@@ -130,7 +139,7 @@ export default function App() {
 
       <div className="tab-content">
         <ErrorBoundary>
-          {tab === "chat" ? <Chat /> : tab === "agents" ? <Agents /> : tab === "health" ? <Health /> : tab === "routines" ? <Routines /> : tab === "vault" ? <Vault /> : tab === "calendar" ? <Calendar /> : tab === "skills" ? <Skills /> : tab === "projects" ? <Projects /> : tab === "security" ? <Security /> : <Vault />}
+          {tab === "home" ? <Home /> : tab === "chat" ? <Chat /> : tab === "agents" ? <Agents /> : tab === "health" ? <Health /> : tab === "routines" ? <Routines /> : tab === "vault" ? <Vault /> : tab === "calendar" ? <Calendar /> : tab === "skills" ? <Skills /> : tab === "projects" ? <Projects /> : tab === "security" ? <Security /> : <Vault />}
         </ErrorBoundary>
       </div>
 
